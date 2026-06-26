@@ -1,0 +1,866 @@
+# Grayscale focus-frame selection.
+# This code uses all valid barcode objects for focusing.
+
+from pathlib import Path
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.ndimage import distance_transform_edt
+from skimage import measure, morphology
+from skimage.segmentation import clear_border
+
+
+# =========================
+# User input
+# =========================
+
+video_path_input = input("Paste the full video file path here: ").strip().strip('"')
+video_path = Path(video_path_input)
+
+if not video_path.exists():
+    raise FileNotFoundError(f"The video file was not found: {video_path}")
+
+
+# =========================
+# User settings
+# =========================
+
+output_folder = video_path.parent / "focus_frame_selection_outputs"
+output_folder.mkdir(parents=True, exist_ok=True)
+
+all_frames_csv = output_folder / "all_frame_focus_measurements.csv"
+all_objects_csv = output_folder / "all_detected_barcode_objects.csv"
+best_frames_csv = output_folder / "best_focus_frame_candidates.csv"
+
+# This value is only used for the rough scan.
+# The final focus analysis uses the valid beads that remain after filtering.
+expected_barcode_count_for_rough_scan = 7
+
+# The refined analysis starts after the rough median diameter is close to this value.
+start_after_target_diameter = True
+target_start_median_diameter_px = 50.0
+target_start_tolerance_px = 10.0
+
+# Object detection settings.
+minimum_object_area_px = 50
+opening_radius_px = 1
+gaussian_kernel_size = (5, 5)
+
+# Barcode size filters.
+minimum_barcode_diameter_px = 20.0
+maximum_barcode_diameter_px = 120.0
+
+# Cluster filter.
+h_maxima_height = 1.5
+
+# Proximity filter.
+# A bead is removed if its centroid is too close to another valid bead.
+minimum_centroid_distance_factor = 1.10
+
+# Focus selection settings.
+minimum_focus_barcodes_per_frame = 1
+
+# The median is used because it is less affected by one noisy bead.
+selection_metric = "median_focus_barcode_diameter_px"
+
+number_of_best_frames_to_save = 10
+
+
+# =========================
+# Video loading
+# =========================
+
+def open_video(path):
+    """Open the focusing video."""
+
+    video = cv2.VideoCapture(str(path))
+    frames_per_second = video.get(cv2.CAP_PROP_FPS)
+
+    if not video.isOpened():
+        raise RuntimeError("The focusing video could not be opened.")
+
+    if frames_per_second == 0:
+        raise RuntimeError("The video frame rate could not be read.")
+
+    return video, frames_per_second
+
+
+def read_video_frame(path, frame_index):
+    """Read one frame from the focusing video."""
+
+    video = cv2.VideoCapture(str(path))
+    video.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+
+    success, frame = video.read()
+    video.release()
+
+    if not success:
+        raise RuntimeError(f"Frame {frame_index} could not be read.")
+
+    return frame
+
+
+# =========================
+# Image processing
+# =========================
+
+def make_binary_mask(frame):
+    """Detect bright barcode objects in a grayscale image."""
+
+    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred_frame = cv2.GaussianBlur(gray_frame, gaussian_kernel_size, 0)
+
+    _, binary_frame = cv2.threshold(
+        blurred_frame,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    binary_mask = binary_frame > 0
+
+    if opening_radius_px > 0:
+        binary_mask = morphology.binary_opening(
+            binary_mask,
+            footprint=morphology.disk(opening_radius_px)
+        )
+
+    binary_mask = morphology.remove_small_objects(
+        binary_mask,
+        min_size=minimum_object_area_px
+    )
+
+    return binary_mask
+
+
+def get_equivalent_diameter(region):
+    """Measure the equivalent diameter of one object."""
+
+    diameter = getattr(region, "equivalent_diameter_area", None)
+
+    if diameter is None:
+        diameter = getattr(region, "equivalent_diameter", None)
+
+    if diameter is None:
+        return None
+
+    diameter = float(diameter)
+
+    if np.isnan(diameter) or np.isinf(diameter):
+        return None
+
+    return diameter
+
+
+def touches_image_border(bbox, image_shape):
+    """Check whether an object touches the image border."""
+
+    min_row, min_col, max_row, max_col = bbox
+    n_rows, n_cols = image_shape
+
+    return (
+        min_row <= 0
+        or min_col <= 0
+        or max_row >= n_rows
+        or max_col >= n_cols
+    )
+
+
+def count_internal_peaks(label_image, component_label, bbox):
+    """Estimate whether one object is a single bead or a cluster."""
+
+    min_row, min_col, max_row, max_col = bbox
+
+    pad = 2
+    row_0 = max(min_row - pad, 0)
+    col_0 = max(min_col - pad, 0)
+    row_1 = min(max_row + pad, label_image.shape[0])
+    col_1 = min(max_col + pad, label_image.shape[1])
+
+    component_mask = label_image[row_0:row_1, col_0:col_1] == component_label
+    distance_map = distance_transform_edt(component_mask)
+
+    peaks = morphology.h_maxima(distance_map, h=h_maxima_height)
+    peaks = peaks & component_mask
+    peaks = clear_border(peaks)
+
+    peak_count = int(measure.label(peaks).max())
+
+    return max(peak_count, 1)
+
+
+# =========================
+# Barcode identification
+# =========================
+
+def identify_barcode_objects(frame, frame_index, time_sec):
+    """Identify beads and remove poor-quality objects."""
+
+    binary_mask = make_binary_mask(frame)
+    label_image = measure.label(binary_mask)
+    regions = measure.regionprops(label_image)
+
+    rows = []
+
+    for object_number, region in enumerate(regions, start=1):
+        equivalent_diameter_px = get_equivalent_diameter(region)
+
+        if equivalent_diameter_px is None:
+            continue
+
+        centroid_y, centroid_x = region.centroid
+
+        internal_peak_count = count_internal_peaks(
+            label_image=label_image,
+            component_label=region.label,
+            bbox=region.bbox
+        )
+
+        discard_reasons = []
+
+        if region.area < minimum_object_area_px:
+            discard_reasons.append("small_area")
+
+        if equivalent_diameter_px < minimum_barcode_diameter_px:
+            discard_reasons.append("diameter_too_small")
+
+        if equivalent_diameter_px > maximum_barcode_diameter_px:
+            discard_reasons.append("diameter_too_large")
+
+        if internal_peak_count > 1:
+            discard_reasons.append("cluster")
+
+        if touches_image_border(region.bbox, label_image.shape):
+            discard_reasons.append("touches_border")
+
+        rows.append({
+            "frame": frame_index,
+            "time_sec": time_sec,
+            "object_id": f"Frame_{frame_index:04d}_Object_{object_number:03d}",
+            "component_label": int(region.label),
+            "centroid_x": float(centroid_x),
+            "centroid_y": float(centroid_y),
+            "area_px": float(region.area),
+            "equivalent_diameter_px": float(equivalent_diameter_px),
+            "internal_peak_count": int(internal_peak_count),
+            "is_cluster": internal_peak_count > 1,
+            "bbox_min_row": int(region.bbox[0]),
+            "bbox_min_col": int(region.bbox[1]),
+            "bbox_max_row": int(region.bbox[2]),
+            "bbox_max_col": int(region.bbox[3]),
+            "discard_reason": "; ".join(discard_reasons) if discard_reasons else None
+        })
+
+    object_table = pd.DataFrame(rows)
+
+    if object_table.empty:
+        return object_table
+
+    object_table = apply_proximity_filter(object_table)
+
+    object_table["is_valid_barcode"] = object_table["discard_reason"].isna()
+    object_table["is_focus_barcode"] = object_table["is_valid_barcode"]
+    object_table["focus_mode"] = "grayscale_all_valid_beads"
+
+    return object_table
+
+
+def apply_proximity_filter(object_table):
+    """Remove beads that are too close to another bead."""
+
+    object_table = object_table.copy()
+
+    object_table["nearest_neighbor_distance_px"] = np.nan
+    object_table["minimum_allowed_neighbor_distance_px"] = np.nan
+
+    preliminary_valid = object_table["discard_reason"].isna()
+    valid_table = object_table[preliminary_valid].copy()
+
+    if len(valid_table) < 2:
+        return object_table
+
+    median_diameter = float(valid_table["equivalent_diameter_px"].median())
+    minimum_allowed_distance = median_diameter * minimum_centroid_distance_factor
+
+    coordinates = valid_table[["centroid_x", "centroid_y"]].to_numpy()
+    valid_indices = valid_table.index.to_list()
+
+    for local_index, global_index in enumerate(valid_indices):
+        distances = np.sqrt(
+            np.sum((coordinates - coordinates[local_index]) ** 2, axis=1)
+        )
+
+        distances[local_index] = np.inf
+        nearest_distance = float(np.min(distances))
+
+        object_table.at[global_index, "nearest_neighbor_distance_px"] = nearest_distance
+        object_table.at[global_index, "minimum_allowed_neighbor_distance_px"] = minimum_allowed_distance
+
+        if nearest_distance < minimum_allowed_distance:
+            current_reason = object_table.at[global_index, "discard_reason"]
+
+            if current_reason is None or pd.isna(current_reason):
+                object_table.at[global_index, "discard_reason"] = "too_close_to_other_bead"
+            else:
+                object_table.at[global_index, "discard_reason"] = (
+                    f"{current_reason}; too_close_to_other_bead"
+                )
+
+    return object_table
+
+
+# =========================
+# Rough start scan
+# =========================
+
+def get_rough_median_diameter(frame):
+    """Measure a rough median diameter before the refined analysis starts."""
+
+    binary_mask = make_binary_mask(frame)
+    label_image = measure.label(binary_mask)
+    regions = measure.regionprops(label_image)
+
+    diameters = []
+
+    for region in regions:
+        if region.area < minimum_object_area_px:
+            continue
+
+        diameter = get_equivalent_diameter(region)
+
+        if diameter is not None:
+            diameters.append(float(diameter))
+
+    if len(diameters) == 0:
+        return None
+
+    diameters = sorted(diameters, reverse=True)
+    diameters = diameters[:expected_barcode_count_for_rough_scan]
+
+    return float(np.median(diameters))
+
+
+def target_diameter_reached(rough_median_diameter):
+    """Check whether the rough median diameter is close to the target diameter."""
+
+    if rough_median_diameter is None:
+        return False
+
+    difference = abs(rough_median_diameter - target_start_median_diameter_px)
+
+    return difference <= target_start_tolerance_px
+
+
+# =========================
+# Frame summary
+# =========================
+
+def summarize_frame(object_table, frame_index, time_sec, rough_median_diameter):
+    """Summarize one frame after barcode filtering."""
+
+    if object_table.empty:
+        return None
+
+    valid_barcodes = object_table[object_table["is_valid_barcode"] == True].copy()
+    focus_barcodes = object_table[object_table["is_focus_barcode"] == True].copy()
+
+    if len(focus_barcodes) < minimum_focus_barcodes_per_frame:
+        return None
+
+    focus_diameters = focus_barcodes["equivalent_diameter_px"].to_numpy()
+
+    focus_mode = str(focus_barcodes["focus_mode"].iloc[0])
+
+    return {
+        "frame": frame_index,
+        "time_sec": time_sec,
+        "rough_median_diameter_px": rough_median_diameter,
+        "focus_mode": focus_mode,
+        "total_objects_detected": len(object_table),
+        "valid_barcode_count": len(valid_barcodes),
+        "focus_barcode_count": len(focus_barcodes),
+        "mean_focus_barcode_diameter_px": float(np.mean(focus_diameters)),
+        "median_focus_barcode_diameter_px": float(np.median(focus_diameters)),
+        "minimum_focus_barcode_diameter_px": float(np.min(focus_diameters)),
+        "maximum_focus_barcode_diameter_px": float(np.max(focus_diameters)),
+        "standard_deviation_focus_diameter_px": float(np.std(focus_diameters)),
+        "focus_object_ids": ", ".join(focus_barcodes["object_id"].tolist()),
+        "focus_diameters_px": ", ".join(f"{value:.2f}" for value in focus_diameters)
+    }
+
+
+# =========================
+# Display
+# =========================
+
+def convert_bgr_to_rgb(frame):
+    """Convert an OpenCV image for display."""
+
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+def display_frame(frame, title):
+    """Display one frame."""
+
+    plt.figure(figsize=(10, 8))
+    plt.imshow(convert_bgr_to_rgb(frame))
+    plt.title(title)
+    plt.axis("off")
+    plt.show()
+
+
+def display_two_frames(left_frame, right_frame, left_title, right_title):
+    """Display two frames side by side."""
+
+    plt.figure(figsize=(16, 8))
+
+    plt.subplot(1, 2, 1)
+    plt.imshow(convert_bgr_to_rgb(left_frame))
+    plt.title(left_title)
+    plt.axis("off")
+
+    plt.subplot(1, 2, 2)
+    plt.imshow(convert_bgr_to_rgb(right_frame))
+    plt.title(right_title)
+    plt.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
+# =========================
+# Annotation
+# =========================
+
+def get_annotation_colour(row):
+    """Choose the annotation colour."""
+
+    if row["is_valid_barcode"] == True:
+        return (0, 255, 0)
+
+    return (0, 0, 255)
+
+
+def annotate_frame(frame, object_table, title, metric_value):
+    """Annotate one frame with barcode decisions."""
+
+    annotated_frame = frame.copy()
+
+    for _, row in object_table.iterrows():
+        x = int(row["centroid_x"])
+        y = int(row["centroid_y"])
+        diameter = float(row["equivalent_diameter_px"])
+
+        colour = get_annotation_colour(row)
+
+        cv2.circle(
+            annotated_frame,
+            (x, y),
+            int(diameter / 2),
+            colour,
+            2
+        )
+
+        if row["discard_reason"] is None or pd.isna(row["discard_reason"]):
+            label_text = f"{diameter:.1f}px"
+        else:
+            label_text = "discarded"
+
+        cv2.putText(
+            annotated_frame,
+            label_text,
+            (x + 5, y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            colour,
+            1
+        )
+
+    cv2.putText(
+        annotated_frame,
+        title,
+        (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        (0, 255, 0),
+        2
+    )
+
+    cv2.putText(
+        annotated_frame,
+        f"{selection_metric}: {metric_value:.2f}px",
+        (10, 55),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        annotated_frame,
+        "Green = valid beads | Red = removed beads",
+        (10, 85),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2
+    )
+
+    return annotated_frame
+
+
+# =========================
+# Saving
+# =========================
+
+def save_raw_frame(frame, file_name):
+    """Save one unmodified frame."""
+
+    output_path = output_folder / file_name
+    cv2.imwrite(str(output_path), frame)
+
+    return output_path
+
+
+def save_annotated_frame(frame, object_table, title, metric_value, file_name):
+    """Save one annotated frame."""
+
+    annotated_frame = annotate_frame(
+        frame=frame,
+        object_table=object_table,
+        title=title,
+        metric_value=metric_value
+    )
+
+    output_path = output_folder / file_name
+    cv2.imwrite(str(output_path), annotated_frame)
+
+    return annotated_frame, output_path
+
+
+# =========================
+# Run analysis
+# =========================
+
+video, frames_per_second = open_video(video_path)
+
+frame_summaries = []
+object_tables = []
+
+start_frame_found = not start_after_target_diameter
+first_refined_frame = None
+
+frame_index = -1
+
+while True:
+    success, frame = video.read()
+
+    if not success:
+        break
+
+    frame_index += 1
+    time_sec = frame_index / frames_per_second
+
+    rough_median_diameter = get_rough_median_diameter(frame)
+
+    if not start_frame_found:
+        if target_diameter_reached(rough_median_diameter):
+            start_frame_found = True
+            first_refined_frame = frame_index
+        else:
+            continue
+
+    object_table = identify_barcode_objects(
+        frame=frame,
+        frame_index=frame_index,
+        time_sec=time_sec
+    )
+
+    if not object_table.empty:
+        object_tables.append(object_table)
+
+    frame_summary = summarize_frame(
+        object_table=object_table,
+        frame_index=frame_index,
+        time_sec=time_sec,
+        rough_median_diameter=rough_median_diameter
+    )
+
+    if frame_summary is not None:
+        frame_summaries.append(frame_summary)
+
+video.release()
+
+if len(frame_summaries) == 0:
+    raise RuntimeError(
+        "No valid focus frames were found. "
+        "Try turning off start_after_target_diameter or widening the diameter filters."
+    )
+
+all_frames = pd.DataFrame(frame_summaries)
+all_frames.to_csv(all_frames_csv, index=False)
+
+if len(object_tables) == 0:
+    raise RuntimeError("No barcode objects were detected.")
+
+all_objects = pd.concat(object_tables, ignore_index=True)
+all_objects.to_csv(all_objects_csv, index=False)
+
+
+# =========================
+# Select focus frames
+# =========================
+
+best_frames = all_frames.sort_values(selection_metric, ascending=True).head(
+    number_of_best_frames_to_save
+).copy()
+
+best_frames["rank"] = range(1, len(best_frames) + 1)
+best_frames.to_csv(best_frames_csv, index=False)
+
+smallest_frame_row = all_frames.sort_values(selection_metric, ascending=True).iloc[0]
+largest_frame_row = all_frames.sort_values(selection_metric, ascending=False).iloc[0]
+
+smallest_frame_index = int(smallest_frame_row["frame"])
+largest_frame_index = int(largest_frame_row["frame"])
+
+smallest_focus_mode = str(smallest_frame_row["focus_mode"])
+largest_focus_mode = str(largest_frame_row["focus_mode"])
+
+
+# =========================
+# Save best raw focus candidates
+# =========================
+
+candidate_paths = []
+
+for _, row in best_frames.iterrows():
+    candidate_frame_index = int(row["frame"])
+    candidate_time_sec = float(row["time_sec"])
+    rank = int(row["rank"])
+
+    candidate_frame = read_video_frame(video_path, candidate_frame_index)
+
+    candidate_path = save_raw_frame(
+        frame=candidate_frame,
+        file_name=(
+            f"RAW_rank_{rank:02d}_frame_{candidate_frame_index:04d}_"
+            f"{candidate_time_sec:.2f}s.png"
+        )
+    )
+
+    candidate_paths.append(str(candidate_path))
+
+best_frames["raw_frame_path"] = candidate_paths
+best_frames.to_csv(best_frames_csv, index=False)
+
+
+# =========================
+# Save raw smallest and largest frames
+# =========================
+
+raw_smallest_frame = read_video_frame(video_path, smallest_frame_index)
+raw_largest_frame = read_video_frame(video_path, largest_frame_index)
+
+raw_smallest_path = save_raw_frame(
+    frame=raw_smallest_frame,
+    file_name=(
+        f"RAW_SMALLEST_frame_{smallest_frame_index:04d}_"
+        f"{float(smallest_frame_row['time_sec']):.2f}s.png"
+    )
+)
+
+raw_largest_path = save_raw_frame(
+    frame=raw_largest_frame,
+    file_name=(
+        f"RAW_LARGEST_frame_{largest_frame_index:04d}_"
+        f"{float(largest_frame_row['time_sec']):.2f}s.png"
+    )
+)
+
+
+# =========================
+# Save annotated smallest and largest frames
+# =========================
+
+smallest_object_table = all_objects[all_objects["frame"] == smallest_frame_index].copy()
+largest_object_table = all_objects[all_objects["frame"] == largest_frame_index].copy()
+
+annotated_smallest_frame, annotated_smallest_path = save_annotated_frame(
+    frame=raw_smallest_frame,
+    object_table=smallest_object_table,
+    title=f"Smallest diameter frame | {smallest_focus_mode}",
+    metric_value=float(smallest_frame_row[selection_metric]),
+    file_name=(
+        f"ANNOTATED_SMALLEST_frame_{smallest_frame_index:04d}_"
+        f"{float(smallest_frame_row['time_sec']):.2f}s.png"
+    )
+)
+
+annotated_largest_frame, annotated_largest_path = save_annotated_frame(
+    frame=raw_largest_frame,
+    object_table=largest_object_table,
+    title=f"Largest diameter frame | {largest_focus_mode}",
+    metric_value=float(largest_frame_row[selection_metric]),
+    file_name=(
+        f"ANNOTATED_LARGEST_frame_{largest_frame_index:04d}_"
+        f"{float(largest_frame_row['time_sec']):.2f}s.png"
+    )
+)
+
+
+# =========================
+# Display raw frames
+# =========================
+
+display_frame(
+    raw_smallest_frame,
+    title=(
+        f"Raw smallest diameter frame | Frame {smallest_frame_index} | "
+        f"{float(smallest_frame_row[selection_metric]):.2f}px | "
+        f"{smallest_focus_mode}"
+    )
+)
+
+display_frame(
+    raw_largest_frame,
+    title=(
+        f"Raw largest diameter frame | Frame {largest_frame_index} | "
+        f"{float(largest_frame_row[selection_metric]):.2f}px | "
+        f"{largest_focus_mode}"
+    )
+)
+
+display_two_frames(
+    left_frame=raw_smallest_frame,
+    right_frame=raw_largest_frame,
+    left_title=(
+        f"Raw smallest diameter frame\n"
+        f"Frame {smallest_frame_index}, "
+        f"{float(smallest_frame_row[selection_metric]):.2f}px\n"
+        f"{smallest_focus_mode}"
+    ),
+    right_title=(
+        f"Raw largest diameter frame\n"
+        f"Frame {largest_frame_index}, "
+        f"{float(largest_frame_row[selection_metric]):.2f}px\n"
+        f"{largest_focus_mode}"
+    )
+)
+
+
+# =========================
+# Display annotated frames
+# =========================
+
+display_two_frames(
+    left_frame=annotated_smallest_frame,
+    right_frame=annotated_largest_frame,
+    left_title="Annotated smallest diameter frame",
+    right_title="Annotated largest diameter frame"
+)
+
+
+# =========================
+# Save raw comparison figure
+# =========================
+
+plt.figure(figsize=(16, 8))
+
+plt.subplot(1, 2, 1)
+plt.imshow(convert_bgr_to_rgb(raw_smallest_frame))
+plt.title(
+    f"Raw smallest diameter frame\n"
+    f"Frame {smallest_frame_index}, "
+    f"{float(smallest_frame_row[selection_metric]):.2f}px\n"
+    f"{smallest_focus_mode}"
+)
+plt.axis("off")
+
+plt.subplot(1, 2, 2)
+plt.imshow(convert_bgr_to_rgb(raw_largest_frame))
+plt.title(
+    f"Raw largest diameter frame\n"
+    f"Frame {largest_frame_index}, "
+    f"{float(largest_frame_row[selection_metric]):.2f}px\n"
+    f"{largest_focus_mode}"
+)
+plt.axis("off")
+
+plt.tight_layout()
+
+raw_comparison_path = output_folder / "RAW_smallest_vs_largest_focus_frames.png"
+plt.savefig(raw_comparison_path, dpi=200, bbox_inches="tight")
+plt.show()
+
+
+# =========================
+# Save annotated comparison figure
+# =========================
+
+plt.figure(figsize=(16, 8))
+
+plt.subplot(1, 2, 1)
+plt.imshow(convert_bgr_to_rgb(annotated_smallest_frame))
+plt.title("Annotated smallest diameter frame")
+plt.axis("off")
+
+plt.subplot(1, 2, 2)
+plt.imshow(convert_bgr_to_rgb(annotated_largest_frame))
+plt.title("Annotated largest diameter frame")
+plt.axis("off")
+
+plt.tight_layout()
+
+annotated_comparison_path = output_folder / "ANNOTATED_smallest_vs_largest_focus_frames.png"
+plt.savefig(annotated_comparison_path, dpi=200, bbox_inches="tight")
+plt.show()
+
+
+# =========================
+# Summary
+# =========================
+
+print("Analysis complete.")
+print(f"Video file analyzed: {video_path}")
+
+if first_refined_frame is not None:
+    print(f"The refined analysis started at frame: {first_refined_frame}")
+
+print(f"All frame measurements were saved to: {all_frames_csv}")
+print(f"All detected barcode objects were saved to: {all_objects_csv}")
+print(f"Best focus-frame candidates were saved to: {best_frames_csv}")
+
+print(f"The raw smallest frame was saved to: {raw_smallest_path}")
+print(f"The raw largest frame was saved to: {raw_largest_path}")
+
+print(f"The annotated smallest frame was saved to: {annotated_smallest_path}")
+print(f"The annotated largest frame was saved to: {annotated_largest_path}")
+
+print(f"The raw comparison figure was saved to: {raw_comparison_path}")
+print(f"The annotated comparison figure was saved to: {annotated_comparison_path}")
+
+print("\nSelected focus-frame candidate:")
+print(
+    f"Frame {smallest_frame_index} at "
+    f"{float(smallest_frame_row['time_sec']):.2f}s had the smallest "
+    f"{selection_metric}: "
+    f"{float(smallest_frame_row[selection_metric]):.2f}px."
+)
+
+print(f"Focus mode: {smallest_focus_mode}")
+
+print("\nOut-of-focus comparison frame:")
+print(
+    f"Frame {largest_frame_index} at "
+    f"{float(largest_frame_row['time_sec']):.2f}s had the largest "
+    f"{selection_metric}: "
+    f"{float(largest_frame_row[selection_metric]):.2f}px."
+)
+
+print(f"Focus mode: {largest_focus_mode}")
+
+print("\nOutput folder:")
+print(output_folder.resolve())
