@@ -1,0 +1,543 @@
+#!/home/qmini/prj-qmini/qmini-venv/bin/python
+ 
+import sys
+print(sys.executable)
+ 
+# General Setup
+import RPi.GPIO as GPIO
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+ 
+# Libraries
+import time
+from time import sleep
+ 
+## For heating and temperature sensing
+import os
+import glob
+ 
+## For peristaltic pumps
+from adafruit_motorkit import MotorKit
+import board
+ 
+## Global Variables
+p1_start = None
+p2_start = None
+p3_start = None
+p4_start = None
+ 
+## Setting up the temperature sensor
+os.system('modprobe w1-gpio')
+os.system('modprobe w1-therm')
+ 
+base_dir = '/sys/bus/w1/devices/'
+device_folder = glob.glob(base_dir + '28*')[0]
+device_file = device_folder + str('/w1_slave')
+ 
+## Setting up the transistor circuits
+laser = 27
+GPIO.setup(laser, GPIO.OUT)
+GPIO.setup(laser, GPIO.LOW)
+ 
+led = 17
+GPIO.setup(led, GPIO.OUT)
+GPIO.setup(led, GPIO.LOW)
+ 
+heatingElement = 22
+GPIO.setup(heatingElement, GPIO.OUT)
+GPIO.setup(heatingElement, GPIO.LOW)
+ 
+# Setting up the servo motors
+ 
+servo_X_control = 5
+GPIO.setup(servo_X_control, GPIO.OUT)
+GPIO.output(servo_X_control, GPIO.LOW)
+ 
+servo_X_pin = 24
+GPIO.setup(servo_X_pin, GPIO.OUT)
+servo_X_pwm = GPIO.PWM(servo_X_pin, 50)
+servo_X_pwm.start(0)
+ 
+ 
+## Setting up the peristaltic pumps
+ 
+kit1=MotorKit()
+ 
+kit1.motor1.throttle = 0
+kit1.motor2.throttle = 0
+kit1.motor3.throttle = 0
+kit1.motor4.throttle = 0
+ 
+# Basic Functions
+ 
+## Peristaltic pumps
+ 
+"""Peristaltic pumps to driver board: GND wire (PP_top) in pos 1,
+VCC wire (PP_btm) in pos 2 -->
+fwd = clockwise (thru top), reverse (thru btm) = counter-clockwise"""
+ 
+def pump1_on():
+    speed1 = float(input("What speed would you like to run the pump 1? (max. 0.6) "))
+    kit1.motor1.throttle = speed1
+    global p1_start
+    p1_start = time.perf_counter()
+    return p1_start
+    
+def pump1_off():
+    if p1_start is None:
+        print('Timer not started for pump 1.')
+        kit1.motor1.throttle = 0 
+    else:
+        p1_stop = time.perf_counter()
+        p1_diff = p1_stop - p1_start
+        print('Time elpased for pump 1: ' + str(p1_diff))
+        kit1.motor1.throttle = 0 
+    
+def pump2_on():
+    speed2 = float(input("What speed would you like to run the pump 2? (max. 0.6) "))
+    kit1.motor2.throttle = speed2
+    global p2_start
+    p2_start = time.perf_counter()
+    return p2_start
+    
+def pump2_off():
+    if p2_start is None:
+        print('Timer not started for pump 2.')
+        kit1.motor2.throttle = 0
+    else:
+        p2_stop = time.perf_counter()
+        p2_diff = p2_stop - p2_start
+        print('Time elpased for pump 2: ' + str(p2_diff))
+        kit1.motor2.throttle = 0
+    
+def pump3_on():
+    speed3 = float(input("What speed would you like to run the pump 3? (max. 0.6) "))
+    kit1.motor3.throttle = speed3
+    global p3_start
+    p3_start = time.perf_counter()
+    return p3_start
+    
+def pump3_off():
+    if p3_start is None:
+        print('Timer not started for pump 3.')
+        kit1.motor3.throttle = 0
+    else:
+        p3_stop = time.perf_counter()
+        p3_diff = p3_stop - p3_start
+        print('Time elpased for pump 3: ' + str(p3_diff))
+        kit1.motor3.throttle = 0
+    
+def pump4_on():
+    speed4 = float(input("What speed would you like to run the pump 4? (max. 0.6) "))
+    kit1.motor4.throttle = speed4
+    global p4_start
+    p4_start = time.perf_counter()
+    return p4_start
+    
+def pump4_off ():
+    if p4_start is None:
+        print('Timer not started for pump 4.')
+        kit1.motor4.throttle = 0
+    else:
+        p4_stop = time.perf_counter()
+        p4_diff = p4_stop - p4_start
+        print('Time elpased for pump 4: ' + str(p4_diff))
+        kit1.motor4.throttle = 0
+ 
+## Temperature sensing
+ 
+def read_temp_raw():
+    f = open(device_file, 'r')
+    lines = f.readlines()
+    f.close()
+    return lines
+ 
+def read_temp_c():
+    lines = read_temp_raw()
+    while lines[0].strip()[-3:] != 'YES':
+        time.sleep(0.2)
+        lines = read_temp_raw()
+    equals_pos = lines[1].find('t=')
+    if equals_pos != -1:
+        temp_string = lines[1][equals_pos+2:]
+        temp_c = int(temp_string)/1000.0
+        temp_c = round(temp_c, 2)
+        return temp_c
+ 
+def print_temp_c():
+    print('Temp: ' + str(read_temp_c()) + ' degrees Celsius. ')
+    
+## Laser
+ 
+def laserOn():
+    print('Laser on.')
+    GPIO.output(laser, GPIO.HIGH)
+    
+def laserOff():
+    print('Laser off.')
+    GPIO.output(laser, GPIO.LOW)
+    
+## LED
+ 
+def ledOn():
+    print('LED on.')
+    GPIO.output(led, GPIO.HIGH)
+    
+def ledOff():
+    print('LED off.')
+    GPIO.output(led, GPIO.LOW)
+ 
+## Heating
+def heaterOn():
+    print('Heat on')
+    GPIO.output(heatingElement, GPIO.HIGH)
+ 
+def heaterOff():
+    print('Heat off')
+    GPIO.output(heatingElement, GPIO.LOW)
+    
+## Servo check
+ 
+def X_check():
+      print('Servo X control check.')
+      GPIO.output(servo_X_control, GPIO.HIGH)
+      sleep(2)
+      GPIO.output(servo_X_control, GPIO.LOW)
+    
+## Servo movement
+ 
+def X_clockwise():
+      print('Servo X will move clockwise.')
+      GPIO.output(servo_X_control, GPIO.HIGH)
+      servo_X_pwm.ChangeDutyCycle(6.0)
+      print('Start turn')
+      sleep(0.1) #0.5
+      print('End turn')
+      GPIO.output(servo_X_control, GPIO.LOW)
+ 
+def X_cclockwise():
+      print('Servo X will move counter-clockwise.')                                                                                                                                                                                                                                                                                                                                                   
+      GPIO.output(servo_X_control, GPIO.HIGH)
+      servo_X_pwm.ChangeDutyCycle(8) #prev 7.5
+      print('Start turn')
+      sleep(0.1) #0.5
+      print('End turn')
+      GPIO.output(servo_X_control, GPIO.LOW)
+    
+## Heating to 40 degrees Celsius and incubating for 15 minutes.
+def temp_40():
+    temp_reading = float(read_temp_c())
+    print('The initial temperature is: ' + str(round(temp_reading, 2)) + ' degrees Celsius. ')
+    while temp_reading < 47.50:
+        print('Heating')
+        GPIO.output(heatingElement, GPIO.HIGH)
+        kit1.motor3.throttle = 0.23
+        time.sleep(0.2)
+        kit1.motor3.throttle = 0
+        time.sleep(0.1)
+        GPIO.output(heatingElement, GPIO.LOW)
+        temp_reading = round(float(read_temp_c()), 2)
+        print('The temperature is now ' + str(temp_reading) + ' degrees Celsius. ')
+    print('The heat block has reached a temperature of ~40 degrees Celsius.')
+ 
+def maintain_40():
+    start_time = time.perf_counter()
+    now_time = time.perf_counter()
+    diff_time = start_time - now_time
+    while diff_time < 900:
+        main_45 = float(read_temp_c())
+        if main_45 < 46.00:
+            print('Heating.')
+            GPIO.output(heatingElement, GPIO.HIGH)
+            kit1.motor2.throttle = 0.23
+            time.sleep(0.2)
+            kit1.motor2.throttle = 0
+            time.sleep(0.1)
+            GPIO.output(heatingElement, GPIO.LOW)
+        else:
+            kit1.motor2.throttle = 0.23
+            time.sleep(0.2)
+            kit1.motor2.throttle = 0
+            print('Maintaining ~40 degrees Celsius. ')
+        start_time = time.perf_counter()
+        diff_time = round(float(start_time - now_time), 2)
+        
+        print('It has been ' + str(diff_time) + ' seconds of maintaining at' + str(round(float(read_temp_c()),2)) + ' degrees Celsius. ')
+ 
+## Heating to 95 degrees Celsius and incubating for 3.75 minutes.
+def temp_95():
+    temp_reading = float(read_temp_c())
+    print('The initial temperature is: ' + str(round(temp_reading, 2)) + ' degrees Celsius. ')
+    while temp_reading < 115.50:
+        print('Heating')
+        GPIO.output(heatingElement, GPIO.HIGH)
+        time.sleep(0.75)
+        GPIO.output(heatingElement, GPIO.LOW)
+        temp_reading = round(float(read_temp_c()), 2)
+        print('The temperature is now ' + str(temp_reading) + ' degrees Celsius. ')
+    print('The heat block has reached a temperature of ~95 degrees Celsius.')
+ 
+def maintain_95():
+    start_time = time.perf_counter()
+    now_time = time.perf_counter()
+    diff_time = start_time - now_time
+    while diff_time < 210:
+        main_45 = float(read_temp_c())
+        if main_45 < 110.00:
+            print('Heating.')
+            GPIO.output(heatingElement, GPIO.HIGH)
+            time.sleep(0.3)
+            GPIO.output(heatingElement, GPIO.LOW)
+        else:
+            print('Maintaining ~95 degrees Celsius. ')
+        start_time = time.perf_counter()
+        diff_time = round(float(start_time - now_time), 2)
+        print('It has been ' + str(diff_time) + ' seconds of maintaining at' + str(round(float(read_temp_c()),2)) + ' degrees Celsius. ')
+ 
+def temp_maintain_mix_95():
+    print('The amplified products will now be denatured.')
+    temp_reading = float(read_temp_c())
+    print('The initial temperature is: ' + str(round(temp_reading, 2)) + ' degrees Celsius. ')
+    while temp_reading < 115.50:
+        print('Heating')
+        
+        if temp_reading > 106.00:
+            GPIO.output(heatingElement, GPIO.HIGH)
+            kit1.motor3.throttle = 0.25
+            time.sleep(0.2)
+            kit1.motor3.throttle = 0
+            time.sleep(0.50)
+            GPIO.output(heatingElement, GPIO.LOW)
+            temp_reading = round(float(read_temp_c()),2)
+            print('The temperature is now ' + str(temp_reading) + 'degrees Celsius. ')
+            
+        else:
+            GPIO.output(heatingElement, GPIO.HIGH)
+            kit1.motor3.throttle = 0.27
+            time.sleep(0.25)
+            kit1.motor3.throtle = 0
+            time.sleep(0.50)
+            GPIO.output(heatingElement, GPIO.LOW)
+            temp_reading = round(float(read_temp_c()),2)
+            print('The temperature is now ' + str(temp_reading) + ' degrees Celsius. ')
+ 
+    print('A temperature of 95 degrees Celsius has been reached. ')
+    print('A temperature of 95 degrees Celsius will be maintained for 3 minutes. ')
+    start_time = time.perf_counter()
+    now_time = time.perf_counter()
+    diff_time = start_time - now_time
+    while diff_time < 180:
+        main_95 = float(read_temp_c())
+        if main_95 < 110.00:
+            print('Heating. ')
+            GPIO.output(heatingElement, GPIO.HIGH)
+            kit1.motor3.throttle = 0.265 #0.285
+            time.sleep(0.25)
+            GPIO.output(heatingElement, GPIO.LOW)
+            time.sleep(0.1)
+            kit1.motor3.throttle = 0
+        else:
+            kit1.motor3.throttle = 0.265
+            time.sleep(0.3)
+            kit1.motor3.throttle = 0
+            print('Maintaining 95 degrees Celsius. ')
+        start_time = time.perf_counter()
+        diff_time = round(float(start_time - now_time), 2)
+        print('It has now been ' + str(diff_time) + ' seconds of maintaining at ' + str(round(float(read_temp_c()),2)) + ' degrees Celsius. ')
+ 
+# Device Functions
+def stepExt():
+    print('Start extraction.')
+    
+    # Dispense 50 uL of FastAmp into the extraction chamber.
+    
+    kit1.motor1.throttle = 0.6
+    time.sleep(23.74)
+    kit1.motor3.throttle = 0
+    
+    # Incubate 50 uL of FastAmp with the sample for 5 minutes at room temperature.
+    # Start heating the amplification chamber to 40 degrees Celsius
+    
+    print('Incubating the sample with the purification-free lysis buffer for 5 minutes at room temperature. ')
+    time.sleep(90)
+    temp_40_start = time.perf_counter()
+    temp_40()
+    temp_40_stop = time.perf_counter()
+    temp_40_total = temp_40_stop - temp_40_start
+    print(temp_40_total)
+    if int(temp_40_total) > 210:
+        report = 300 - (temp_40_total + 90)
+        print('Heating incubation was too long by ' + str(report) + ' seconds. ')
+    else:
+        incubation = int(300 - (temp_40_total + 90))
+        print('Incubation period of: ' + str(incubation) + ' seconds started. ')
+        time.sleep(incubation)
+    print('Sample incubated with purification-free lysis buffer for 5 minutes at room temperature. ')
+    print('End extraction. ')
+ 
+def stepAmp():
+    print('Start amplification. ')
+    # Heating the amplification chamber to ~40 degrees Celsius.
+    temp_40()
+    # Dispense 90 uL of rehydration buffer into the extraction chamber.
+    print('The step of dispensing 90 uL of rehydration buffer into extraction buffer is temporarily skipped. ')
+    
+    #print('Dispensing 90 uL of rehydration buffer into the extraction chamber. ')
+    #kit1.motor4.throttle = -0.4
+    #time.sleep(32.82)
+    #kit1.motor4.throttle = 0
+    #print('90 uL of rehydration buffer dispensed into the extraction chamber. ')
+    
+    # Slowly mixing the extracted sample with the lyophilized pellets at 40 degrees Celsius for 15 minutes.
+    kit1.motor2.throttle = 0.3
+    time.sleep(30) #18 (for movement) +12 for mixing)
+    kit1.motor2.throttle = 0
+    maintain_40()
+    
+    print('End amplification. ')
+    #print('Start denaturation. ')
+    #temp_maintain_mix_95()
+    print('End denaturation. ')
+ 
+def stepDet():
+    print('Start detection. ')
+    kit1.motor3.throttle = -0.3
+    time.sleep(15)
+    kit1.motor3.throttle = 0
+ 
+    start_time = time.perf_counter()
+    now_time = time.perf_counter()
+    diff_time = start_time - now_time
+ 
+    while diff_time < 1200:
+        if diff_time < 600:
+            kit1.motor3.throttle = -0.3
+            time.sleep(0.73)
+            kit1.motor3.throttle = 0
+            time.sleep(29.5)
+        elif 900 < diff_time < 1200:
+            kit1.motor3.throttle = -0.25
+            time.sleep(0.5)
+            kit1.motor3.throttle = 0
+            time.sleep(30.5)
+        start_time = time.perf_counter()
+        diff_time = round(float(start_time - now_time),2)
+        print('It has been ' + str(diff_time) + ' seconds. ')
+    print('End detection.')
+ 
+def stepLoad():
+    print('Dispensing initial volume of wash buffer into detection chamber. ')
+    kit1.motor2.throttle = -0.3
+    time.sleep(37.00) #42
+    kit1.motor2.throttle = 0
+    print('Start loading. ')
+    kit1.motor1.throttle = 0.3
+    time.sleep(11.50)
+    kit1.motor1.throttle = 0
+    time.sleep(20.00)
+    kit1.motor2.throttle = -0.3
+    time.sleep(2.5)
+    kit1.motor2.throttle = 0
+    print('Loading completed. ')
+ 
+def stepWashing():
+    print('Washing away unbound sample components and reporter probes. ')
+    # Wash buffer
+    kit1.motor2.throttle = -0.30
+    # Removal to waste
+    kit1.motor1.throttle = 0.31 
+    time.sleep(101.00)
+    # Stop removal to waste
+    kit1.motor1.throttle = 0   
+    time.sleep(5.28)
+    # Stop wash buffer dispensing into the detection chamber,
+    kit1.motor2.throttle = 0
+    print('Ready for imaging. ')
+ 
+def stepRemoval():
+    print('Removal all waste from the base system. ')
+    kit1.motor1.throttle = 0.3
+    kit1.motor2.throttle = -0.3
+    time.sleep(50.00)
+    kit1.motor1.throttle = 0
+    kit1.motor2.throttle = 0
+    print('The cartridge has been processed. ')
+ 
+# List of user inputs
+## Dictionary of functions mapped to associated user inputs.
+functions = {
+    '1': print_temp_c,
+    '2': heaterOn,
+    '3': heaterOff,
+    '4': temp_40,
+    '5': maintain_40,
+    '6': temp_95,
+    '7': maintain_95,
+    '8': temp_maintain_mix_95,
+    '9': pump1_on,
+    '10': pump1_off,
+    '11': pump2_on,
+    '12': pump2_off,
+    '13': pump3_on,
+    '14': pump3_off,
+    '15': pump4_on,
+    '16': pump4_off,
+    '23': laserOn,
+    '24': laserOff,
+    '25': ledOn,
+    '26': ledOff,
+    '27': X_check,
+    '28': X_clockwise,
+    '29': X_cclockwise,   
+   '17': stepExt,
+    '18': stepAmp,
+   '19': stepDet,
+    '20': stepLoad,
+    '21': stepWashing,
+    '22': stepRemoval,
+    }
+ 
+ 
+print('Select a function:')
+print('1. Print the current temperature. ')
+print('2. Turn on the heating element. ')
+print('3. Turn off the heating element. ')
+print('4. Heat to 40 degrees Celsius. ')
+print('5. Maintain 40 degrees Celsius for 15 minutes. ')
+print('6. Heat to 95 degrees Celsius. ')
+print('7. Maintain 95 degrees Celsius for 3.5 minutes. ')
+print('8. Heat and maintain at 95 degrees Celsius for 3.5 minutes while mixing. ')
+print('9. Turn on pump 1. ')
+print('10. Turn off pump 1. ')
+print('11. Turn on pump 2. ')
+print('12. Turn off pump 2. ')
+print('13. Turn on pump 3. ')
+print('14. Turn off pump 3. ')
+print('15. Turn on pump 4. ')
+print('16. TUrn off pump 4. ')
+print('17. Extraction step.')
+print('18. Amplification step.')
+print('19. Detection step.')
+print('20. Loading step. ')
+print('21. Washing step. ')
+print('22. Removing step. ')
+print('23. Laser on.')
+print('24. Laser off.')
+print('25. LED on.')
+print('26. LED off.')
+print('27. Servo X check.')
+print('28. Turn servo clockwise or down')
+print('29. Turn servo counterclockwise or up')
+ 
+# Continuously prompt for user input and execute the respective function.
+while True:
+    user_input = input('Select an action from the list or type "quit" to exit: ')
+    if user_input == 'quit':
+        GPIO.output(servo_X_control, GPIO.LOW)
+        servo_X_pwm.stop()
+        GPIO.cleanup()
+        break
+    elif user_input in functions:
+        functions[user_input]()
+    else:
+        print('Invalid input. Please type a number or type "quit" to exit.')
