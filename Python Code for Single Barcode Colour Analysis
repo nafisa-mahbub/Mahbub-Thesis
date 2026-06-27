@@ -1,0 +1,520 @@
+# Figure 4.4 and 4.5 -- barcode average RGB and wavelength assignment
+
+# Libraries
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+from PIL import Image
+from scipy.ndimage import distance_transform_edt
+from skimage import filters, measure, morphology
+from skimage.segmentation import clear_border
+
+
+# User inputs for the image path and the output folder path
+
+image_path = Path(input("Enter the full image path: ").strip().strip('"'))
+output_dir = Path(input("Enter the output folder path: ").strip().strip('"'))
+
+output_dir.mkdir(parents=True, exist_ok=True)
+
+output_csv_name = "barcode_average_rgb_single_image.csv"
+output_csv_path = output_dir / output_csv_name
+
+
+# Objects smaller than this are removed
+
+min_area = 20
+
+# Cluster filter
+
+h_maxima_height = 0.68
+
+# Background correction
+
+background_sigma = 30
+
+# Otsu threshold multiplier
+
+threshold_scale = 1.75
+
+# Removes minor artifacts
+
+opening_radius = 1
+
+# Diameter tolerance relative to the average single-barcode diameter
+
+diameter_tolerance = 0.40
+
+# Remove barcode candidates that touch the image border
+
+reject_border_touching = True
+
+
+# Load image as RGB
+
+def load_rgb_image(image_path: Path) -> np.ndarray:
+
+    image_path = Path(str(image_path).strip().strip('"'))
+
+    if not image_path.exists():
+        raise FileNotFoundError(f"File does not exist:\n{image_path}")
+
+    if image_path.is_dir():
+        raise IsADirectoryError(
+            f"This path is a folder, not an image file:\n{image_path}\n"
+            "Paste the full path ending in .tif, .tiff, .png, .jpg, etc."
+        )
+
+    return np.asarray(Image.open(image_path).convert("RGB"))
+
+
+# Converts a diameter value to a float unless it is not valid
+
+def safe_float(x) -> Optional[float]:
+
+    if x is None:
+        return None
+
+    x = float(x)
+
+    if np.isnan(x) or np.isinf(x):
+        return None
+
+    return x
+
+
+# Checks if the barcode candidate touches the image border
+
+def touches_border(
+    bbox: tuple[int, int, int, int],
+    shape: tuple[int, int],
+) -> bool:
+
+    minr, minc, maxr, maxc = bbox
+    nrows, ncols = shape
+
+    return minr <= 0 or minc <= 0 or maxr >= nrows or maxc >= ncols
+
+
+# Measures equivalent pixel diameter of the object
+
+def get_equivalent_diameter(prop) -> Optional[float]:
+
+    value = getattr(prop, "equivalent_diameter_area", None)
+
+    if value is None:
+        value = getattr(prop, "equivalent_diameter", None)
+
+    return safe_float(value)
+
+
+# Normalizes RGB values so red, green, and blue sum to one
+
+def normalize_rgb_values(
+    r: float,
+    g: float,
+    b: float,
+) -> tuple[float, float, float, str]:
+
+    total = r + g + b
+
+    if total > 0:
+        normalized_r = r / total
+        normalized_g = g / total
+        normalized_b = b / total
+    else:
+        normalized_r = 0.0
+        normalized_g = 0.0
+        normalized_b = 0.0
+
+    rgb_norm_text = f"({normalized_r:.6f}, {normalized_g:.6f}, {normalized_b:.6f})"
+
+    return normalized_r, normalized_g, normalized_b, rgb_norm_text
+
+
+# Calculates average RGB and normalized RGB for one barcode
+
+def compute_barcode_average_rgb(
+    pixels: np.ndarray,
+) -> tuple[float, float, float, float, float, float, str, str]:
+
+    mean_r = float(np.mean(pixels[:, 0]))
+    mean_g = float(np.mean(pixels[:, 1]))
+    mean_b = float(np.mean(pixels[:, 2]))
+
+    normalized_r, normalized_g, normalized_b, barcode_rgb_norm = normalize_rgb_values(
+        mean_r,
+        mean_g,
+        mean_b,
+    )
+
+    barcode_rgb_raw = f"({mean_r:.2f}, {mean_g:.2f}, {mean_b:.2f})"
+
+    return (
+        mean_r,
+        mean_g,
+        mean_b,
+        normalized_r,
+        normalized_g,
+        normalized_b,
+        barcode_rgb_raw,
+        barcode_rgb_norm,
+    )
+
+
+# Lists RGB channels from highest normalized intensity to lowest
+
+def get_channel_rank_order(
+    normalized_r: float,
+    normalized_g: float,
+    normalized_b: float,
+) -> str:
+
+    channel_values = [
+        ("Red", float(normalized_r)),
+        ("Green", float(normalized_g)),
+        ("Blue", float(normalized_b)),
+    ]
+
+    sorted_channels = sorted(
+        channel_values,
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    rank_order = ", ".join([channel for channel, _ in sorted_channels])
+
+    return rank_order
+
+
+# Assigns wavelength using normalized RGB channel ranking
+
+def assign_wavelength_from_normalized_rgb(
+    normalized_r: float,
+    normalized_g: float,
+    normalized_b: float,
+) -> tuple[str, str]:
+
+    channel_rank_order = get_channel_rank_order(
+        normalized_r=normalized_r,
+        normalized_g=normalized_g,
+        normalized_b=normalized_b,
+    )
+
+    if channel_rank_order in ["Green, Blue, Red", "Blue, Green, Red"]:
+        assigned_wavelength_nm = "520"
+
+    elif channel_rank_order == "Green, Red, Blue":
+        assigned_wavelength_nm = "575"
+
+    elif channel_rank_order == "Red, Green, Blue":
+        if normalized_b < 0.10:
+            assigned_wavelength_nm = "600"
+        else:
+            assigned_wavelength_nm = "575"
+
+    else:
+        assigned_wavelength_nm = "unassigned"
+
+    return assigned_wavelength_nm, channel_rank_order
+
+
+# Adds wavelength identity to each valid barcode
+
+def assign_wavelengths_to_barcodes(
+    valid_df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    valid_df = valid_df.copy()
+
+    valid_df["channel_rank_order"] = None
+    valid_df["assigned_wavelength_nm"] = None
+
+    for idx, row in valid_df.iterrows():
+        assigned_wavelength_nm, channel_rank_order = assign_wavelength_from_normalized_rgb(
+            normalized_r=float(row["normalized_r"]),
+            normalized_g=float(row["normalized_g"]),
+            normalized_b=float(row["normalized_b"]),
+        )
+
+        valid_df.at[idx, "channel_rank_order"] = channel_rank_order
+        valid_df.at[idx, "assigned_wavelength_nm"] = assigned_wavelength_nm
+
+    return valid_df
+
+
+# Generate a colour-neutral fluorescence score
+
+def fluorescence_score(rgb: np.ndarray) -> np.ndarray:
+
+    rgb = rgb.astype(np.float32)
+
+    max_channel = np.max(rgb, axis=2)
+    mean_channel = np.mean(rgb, axis=2)
+
+    score = max_channel + 0.25 * mean_channel
+
+    return score
+
+
+# Generate a binary barcode mask from the fluorescence score
+
+def make_binary_mask(
+    score: np.ndarray,
+    min_area: int,
+) -> np.ndarray:
+
+    background = filters.gaussian(
+        score,
+        sigma=background_sigma,
+        preserve_range=True,
+    )
+
+    corrected_score = score - background
+    corrected_score = np.clip(corrected_score, 0, None)
+
+    otsu_threshold = filters.threshold_otsu(corrected_score)
+    final_threshold = otsu_threshold * threshold_scale
+
+    mask = corrected_score > final_threshold
+
+    mask = morphology.remove_small_objects(
+        mask,
+        min_size=min_area,
+    )
+
+    if opening_radius > 0:
+        mask = morphology.binary_opening(
+            mask,
+            footprint=morphology.disk(opening_radius),
+        )
+
+    return mask
+
+
+# Determine if the detected object is a single barcode or a cluster
+
+def count_internal_peaks(
+    label_image: np.ndarray,
+    component_label: int,
+    bbox: tuple[int, int, int, int],
+    h_maxima_height: float,
+) -> int:
+
+    minr, minc, maxr, maxc = bbox
+
+    pad = 2
+
+    r0 = max(minr - pad, 0)
+    c0 = max(minc - pad, 0)
+    r1 = min(maxr + pad, label_image.shape[0])
+    c1 = min(maxc + pad, label_image.shape[1])
+
+    component_mask = label_image[r0:r1, c0:c1] == component_label
+
+    distance_map = distance_transform_edt(component_mask)
+
+    peaks = morphology.h_maxima(
+        distance_map,
+        h=h_maxima_height,
+    )
+
+    peaks &= component_mask
+    peaks = clear_border(peaks)
+
+    peak_count = int(measure.label(peaks).max())
+
+    return max(peak_count, 1)
+
+
+# Identifies the barcode candidates from labelled connected components
+
+def build_regular_detections(
+    rgb: np.ndarray,
+    labels: np.ndarray,
+    h_maxima_height: float,
+) -> pd.DataFrame:
+
+    score = fluorescence_score(rgb)
+
+    props = measure.regionprops(labels, intensity_image=score)
+    props = sorted(props, key=lambda p: (p.centroid[0], p.centroid[1]))
+
+    rows = []
+
+    for idx, prop in enumerate(props, start=1):
+        component_mask = labels == prop.label
+
+        pixels = rgb[component_mask]
+
+        if len(pixels) == 0:
+            continue
+
+        rr, cc = np.nonzero(component_mask)
+        weights = score[component_mask].astype(np.float64)
+
+        if np.allclose(weights.sum(), 0):
+            centroid_y, centroid_x = prop.centroid
+        else:
+            centroid_y = float(np.average(rr, weights=weights))
+            centroid_x = float(np.average(cc, weights=weights))
+
+        peak_count = count_internal_peaks(
+            label_image=labels,
+            component_label=prop.label,
+            bbox=prop.bbox,
+            h_maxima_height=h_maxima_height,
+        )
+
+        category = "cluster" if peak_count > 1 else "single"
+
+        equivalent_diameter_px = get_equivalent_diameter(prop)
+
+        (
+            mean_r,
+            mean_g,
+            mean_b,
+            normalized_r,
+            normalized_g,
+            normalized_b,
+            barcode_rgb_raw,
+            barcode_rgb_norm,
+        ) = compute_barcode_average_rgb(pixels)
+
+        rows.append({
+            "point_id": f"Point_{idx:03d}",
+            "component_label": int(prop.label),
+            "category": category,
+            "internal_peak_count": peak_count,
+            "touches_image_border": touches_border(prop.bbox, labels.shape),
+            "centroid_x": centroid_x,
+            "centroid_y": centroid_y,
+            "equivalent_diameter_px": equivalent_diameter_px,
+            "mean_r": mean_r,
+            "mean_g": mean_g,
+            "mean_b": mean_b,
+            "normalized_r": normalized_r,
+            "normalized_g": normalized_g,
+            "normalized_b": normalized_b,
+            "barcode_rgb_raw": barcode_rgb_raw,
+            "barcode_rgb_norm": barcode_rgb_norm,
+        })
+
+    columns = [
+        "point_id",
+        "component_label",
+        "category",
+        "internal_peak_count",
+        "touches_image_border",
+        "centroid_x",
+        "centroid_y",
+        "equivalent_diameter_px",
+        "mean_r",
+        "mean_g",
+        "mean_b",
+        "normalized_r",
+        "normalized_g",
+        "normalized_b",
+        "barcode_rgb_raw",
+        "barcode_rgb_norm",
+    ]
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+# Keeps only valid single barcodes
+
+# A valid barcode is: single, does not touch the image border, and has a diameter within the selected tolerance
+
+def filter_valid_barcodes(
+    df: pd.DataFrame,
+    diameter_tolerance: float,
+    reject_border_touching: bool,
+) -> pd.DataFrame:
+
+    if df.empty:
+        return df.copy()
+
+    single_candidates = df[
+        (df["category"] == "single") &
+        (df["equivalent_diameter_px"].notna())
+    ].copy()
+
+    if reject_border_touching:
+        single_candidates = single_candidates[
+            single_candidates["touches_image_border"] == False
+        ].copy()
+
+    if single_candidates.empty:
+        return df.iloc[0:0].copy()
+
+    average_diameter_px = float(single_candidates["equivalent_diameter_px"].mean())
+
+    single_candidates["diameter_relative_error"] = (
+        abs(single_candidates["equivalent_diameter_px"] - average_diameter_px)
+        / max(average_diameter_px, 1e-6)
+    )
+
+    valid_df = single_candidates[
+        single_candidates["diameter_relative_error"] <= diameter_tolerance
+    ].copy()
+
+    return valid_df
+
+
+# Executes the image analysis pipeline
+
+rgb = load_rgb_image(image_path)
+
+score = fluorescence_score(rgb)
+
+mask = make_binary_mask(
+    score=score,
+    min_area=min_area,
+)
+
+labels = measure.label(mask)
+
+detections_df = build_regular_detections(
+    rgb=rgb,
+    labels=labels,
+    h_maxima_height=h_maxima_height,
+)
+
+valid_df = filter_valid_barcodes(
+    df=detections_df,
+    diameter_tolerance=diameter_tolerance,
+    reject_border_touching=reject_border_touching,
+)
+
+valid_df = valid_df.reset_index(drop=True)
+valid_df["barcode_number"] = np.arange(1, len(valid_df) + 1)
+
+valid_df = assign_wavelengths_to_barcodes(valid_df)
+
+final_df = valid_df[[
+    "barcode_number",
+    "point_id",
+
+    "assigned_wavelength_nm",
+    "channel_rank_order",
+
+    "internal_peak_count",
+
+    "mean_r",
+    "mean_g",
+    "mean_b",
+    "normalized_r",
+    "normalized_g",
+    "normalized_b",
+    "barcode_rgb_raw",
+    "barcode_rgb_norm",
+]].copy()
+
+final_df.to_csv(output_csv_path, index=False)
