@@ -1,0 +1,804 @@
+# Figure 4.6 -- barcode-reporter colocalization analysis for single colour population
+
+# Libraries
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+from PIL import Image
+from scipy.ndimage import distance_transform_edt
+from skimage import filters, measure, morphology
+from skimage.segmentation import clear_border
+
+
+# User inputs for barcode image, reporter image, and output folder
+
+barcode_image_path = Path(input("Enter the full barcode image path: ").strip().strip('"'))
+reporter_image_path = Path(input("Enter the full reporter image path: ").strip().strip('"'))
+output_folder = Path(input("Enter the output folder path: ").strip().strip('"'))
+
+output_folder.mkdir(parents=True, exist_ok=True)
+
+barcode_output_csv_name = "barcode_colour_reporter_colocalization.csv"
+group_output_csv_name = "colour_group_reporter_summary.csv"
+
+barcode_output_csv_path = output_folder / barcode_output_csv_name
+group_output_csv_path = output_folder / group_output_csv_name
+
+
+# Barcode detection settings
+
+# Objects smaller than this are removed
+
+min_area = 20
+
+# Cluster filter
+
+h_maxima_height = 0.68
+
+# Background correction
+
+background_sigma = 30
+
+# Otsu threshold multiplier
+
+threshold_scale = 1.75
+
+# Removes minor artifacts
+
+opening_radius = 1
+
+# Diameter tolerance relative to the average single-barcode diameter
+
+diameter_tolerance = 0.40
+
+# Remove barcode candidates that touch the image border
+
+reject_border_touching = True
+
+
+# Reporter detection settings
+
+# Expands the reporter ROI around each barcode
+
+reporter_roi_expansion_factor = 1.10
+
+# Minimum reporter object diameter relative to the barcode diameter
+
+min_reporter_signal_fraction_of_barcode_diameter = 0.30
+
+# Smooths the reporter image before thresholding
+
+reporter_gaussian_sigma = 1.0
+
+# Otsu threshold multiplier for the reporter image
+
+reporter_threshold_scale = 1.25
+
+# Removes small reporter specks
+
+reporter_despeckle_min_area = 8
+
+# Removes minor reporter mask artifacts
+
+reporter_opening_radius = 1
+
+# Uses the centre of the image to calculate reporter threshold
+
+reporter_border_fraction_for_threshold = 0.08
+
+# Removes reporter signal from the image border
+
+reporter_remove_border_band = 5
+
+
+# Group-level positivity setting
+
+# A colour group is positive if at least 70% of barcodes in that group are reporter-positive
+
+group_positive_fraction_cutoff = 0.70
+
+
+# Checks that the image path exists and is an image file
+
+def validate_image_path(image_path: Path) -> Path:
+
+    image_path = Path(str(image_path).strip().strip('"'))
+
+    if not image_path.exists():
+        raise FileNotFoundError(f"File does not exist:\n{image_path}")
+
+    if image_path.is_dir():
+        raise IsADirectoryError(
+            f"This path is a folder, not an image file:\n{image_path}\n"
+            "Paste the full path ending in .tif, .tiff, .png, .jpg, etc."
+        )
+
+    return image_path
+
+
+# Load barcode image as RGB
+
+def load_rgb_image(image_path: Path) -> np.ndarray:
+
+    image_path = validate_image_path(image_path)
+
+    return np.asarray(Image.open(image_path).convert("RGB"))
+
+
+# Load reporter image as grayscale
+
+def load_gray_image(image_path: Path) -> np.ndarray:
+
+    image_path = validate_image_path(image_path)
+
+    return np.asarray(Image.open(image_path).convert("L"))
+
+
+# Converts a value to a float unless it is not valid
+
+def safe_float(value) -> Optional[float]:
+
+    if value is None:
+        return None
+
+    value = float(value)
+
+    if np.isnan(value) or np.isinf(value):
+        return None
+
+    return value
+
+
+# Checks if the barcode candidate touches the image border
+
+def touches_border(
+    bbox: tuple[int, int, int, int],
+    image_shape: tuple[int, int],
+) -> bool:
+
+    min_row, min_col, max_row, max_col = bbox
+    n_rows, n_cols = image_shape
+
+    return (
+        min_row <= 0
+        or min_col <= 0
+        or max_row >= n_rows
+        or max_col >= n_cols
+    )
+
+
+# Measures equivalent pixel diameter of the object
+
+def get_equivalent_diameter(region) -> Optional[float]:
+
+    diameter = getattr(region, "equivalent_diameter_area", None)
+
+    if diameter is None:
+        diameter = getattr(region, "equivalent_diameter", None)
+
+    return safe_float(diameter)
+
+
+# Normalize RGB values so red, green, and blue sum to one
+
+def normalize_rgb(
+    average_r: float,
+    average_g: float,
+    average_b: float,
+) -> tuple[float, float, float]:
+
+    total = average_r + average_g + average_b
+
+    if total <= 0:
+        return 0.0, 0.0, 0.0
+
+    normalized_r = average_r / total
+    normalized_g = average_g / total
+    normalized_b = average_b / total
+
+    return normalized_r, normalized_g, normalized_b
+
+
+# Calculate average RGB and normalized RGB for one barcode
+
+def calculate_average_rgb(
+    barcode_pixels: np.ndarray,
+) -> tuple[float, float, float, float, float, float]:
+
+    average_r = float(np.mean(barcode_pixels[:, 0]))
+    average_g = float(np.mean(barcode_pixels[:, 1]))
+    average_b = float(np.mean(barcode_pixels[:, 2]))
+
+    normalized_r, normalized_g, normalized_b = normalize_rgb(
+        average_r=average_r,
+        average_g=average_g,
+        average_b=average_b,
+    )
+
+    return (
+        average_r,
+        average_g,
+        average_b,
+        normalized_r,
+        normalized_g,
+        normalized_b,
+    )
+
+
+# Rank RGB channels from highest normalized intensity to lowest
+
+def rank_rgb_channels(
+    normalized_r: float,
+    normalized_g: float,
+    normalized_b: float,
+) -> tuple[str, str, str]:
+
+    channel_values = [
+        ("Red", float(normalized_r)),
+        ("Green", float(normalized_g)),
+        ("Blue", float(normalized_b)),
+    ]
+
+    ranked_channels = sorted(
+        channel_values,
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    channel_rank_1 = ranked_channels[0][0]
+    channel_rank_2 = ranked_channels[1][0]
+    channel_rank_3 = ranked_channels[2][0]
+
+    return channel_rank_1, channel_rank_2, channel_rank_3
+
+
+# Assign barcode colour identity using normalized RGB channel ranking
+
+def assign_colour_id(
+    channel_rank_1: str,
+    channel_rank_2: str,
+    channel_rank_3: str,
+    normalized_b: float,
+) -> str:
+
+    channel_order = (channel_rank_1, channel_rank_2, channel_rank_3)
+
+    if channel_order in [
+        ("Green", "Blue", "Red"),
+        ("Blue", "Green", "Red"),
+    ]:
+        colour_id = "520"
+
+    elif channel_order == ("Green", "Red", "Blue"):
+        colour_id = "575"
+
+    elif channel_order == ("Red", "Green", "Blue"):
+        if normalized_b < 0.10:
+            colour_id = "600"
+        else:
+            colour_id = "575"
+
+    else:
+        colour_id = "unassigned"
+
+    return colour_id
+
+
+# Generate a colour-neutral fluorescence score for barcode detection
+
+def calculate_fluorescence_score(rgb_image: np.ndarray) -> np.ndarray:
+
+    rgb_image = rgb_image.astype(np.float32)
+
+    max_channel = np.max(rgb_image, axis=2)
+    mean_channel = np.mean(rgb_image, axis=2)
+
+    fluorescence_score = max_channel + 0.25 * mean_channel
+
+    return fluorescence_score
+
+
+# Generate barcode mask from the fluorescence score
+
+def create_barcode_mask(
+    fluorescence_score: np.ndarray,
+) -> np.ndarray:
+
+    background = filters.gaussian(
+        fluorescence_score,
+        sigma=background_sigma,
+        preserve_range=True,
+    )
+
+    corrected_score = fluorescence_score - background
+    corrected_score = np.clip(corrected_score, 0, None)
+
+    otsu_threshold = filters.threshold_otsu(corrected_score)
+    final_threshold = otsu_threshold * threshold_scale
+
+    barcode_mask = corrected_score > final_threshold
+
+    barcode_mask = morphology.remove_small_objects(
+        barcode_mask,
+        min_size=min_area,
+    )
+
+    if opening_radius > 0:
+        barcode_mask = morphology.binary_opening(
+            barcode_mask,
+            footprint=morphology.disk(opening_radius),
+        )
+
+    return barcode_mask
+
+
+# Determine if the detected object is a single barcode or a cluster
+
+def count_internal_peaks(
+    label_image: np.ndarray,
+    component_label: int,
+    bbox: tuple[int, int, int, int],
+) -> int:
+
+    min_row, min_col, max_row, max_col = bbox
+
+    pad = 2
+
+    row_start = max(min_row - pad, 0)
+    col_start = max(min_col - pad, 0)
+    row_end = min(max_row + pad, label_image.shape[0])
+    col_end = min(max_col + pad, label_image.shape[1])
+
+    component_mask = label_image[row_start:row_end, col_start:col_end] == component_label
+
+    distance_map = distance_transform_edt(component_mask)
+
+    peaks = morphology.h_maxima(
+        distance_map,
+        h=h_maxima_height,
+    )
+
+    peaks = peaks & component_mask
+    peaks = clear_border(peaks)
+
+    peak_count = int(measure.label(peaks).max())
+
+    return max(peak_count, 1)
+
+
+# Identify barcode candidates from the barcode image
+
+def detect_candidate_barcodes(
+    barcode_rgb: np.ndarray,
+) -> pd.DataFrame:
+
+    fluorescence_score = calculate_fluorescence_score(barcode_rgb)
+    barcode_mask = create_barcode_mask(fluorescence_score)
+    label_image = measure.label(barcode_mask)
+
+    regions = measure.regionprops(label_image, intensity_image=fluorescence_score)
+    regions = sorted(regions, key=lambda region: (region.centroid[0], region.centroid[1]))
+
+    rows = []
+
+    for region in regions:
+        component_mask = label_image == region.label
+        barcode_pixels = barcode_rgb[component_mask]
+
+        if len(barcode_pixels) == 0:
+            continue
+
+        rows_px, cols_px = np.nonzero(component_mask)
+        weights = fluorescence_score[component_mask].astype(np.float64)
+
+        if np.allclose(weights.sum(), 0):
+            centroid_y, centroid_x = region.centroid
+        else:
+            centroid_y = float(np.average(rows_px, weights=weights))
+            centroid_x = float(np.average(cols_px, weights=weights))
+
+        internal_peak_count = count_internal_peaks(
+            label_image=label_image,
+            component_label=region.label,
+            bbox=region.bbox,
+        )
+
+        category = "cluster" if internal_peak_count > 1 else "single"
+
+        pixel_diameter = get_equivalent_diameter(region)
+
+        (
+            average_r,
+            average_g,
+            average_b,
+            normalized_r,
+            normalized_g,
+            normalized_b,
+        ) = calculate_average_rgb(barcode_pixels)
+
+        channel_rank_1, channel_rank_2, channel_rank_3 = rank_rgb_channels(
+            normalized_r=normalized_r,
+            normalized_g=normalized_g,
+            normalized_b=normalized_b,
+        )
+
+        colour_id = assign_colour_id(
+            channel_rank_1=channel_rank_1,
+            channel_rank_2=channel_rank_2,
+            channel_rank_3=channel_rank_3,
+            normalized_b=normalized_b,
+        )
+
+        rows.append({
+            "component_label": int(region.label),
+            "category": category,
+            "touches_border": touches_border(region.bbox, label_image.shape),
+            "centroid X position": centroid_x,
+            "centroid Y position": centroid_y,
+            "pixel diameter": pixel_diameter,
+            "average r": average_r,
+            "average g": average_g,
+            "average b": average_b,
+            "normalized r": normalized_r,
+            "normalized g": normalized_g,
+            "normalized b": normalized_b,
+            "channel rank 1": channel_rank_1,
+            "channel rank 2": channel_rank_2,
+            "channel rank 3": channel_rank_3,
+            "colour id": colour_id,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# Keep only valid single barcodes
+
+# A valid barcode is: single, does not touch the image border, and has a diameter within the selected tolerance
+
+def filter_valid_barcodes(
+    candidate_df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if candidate_df.empty:
+        return candidate_df.copy()
+
+    valid_df = candidate_df[
+        (candidate_df["category"] == "single")
+        & (candidate_df["pixel diameter"].notna())
+    ].copy()
+
+    if reject_border_touching:
+        valid_df = valid_df[valid_df["touches_border"] == False].copy()
+
+    if valid_df.empty:
+        return valid_df
+
+    average_single_diameter = float(valid_df["pixel diameter"].mean())
+
+    valid_df["diameter relative error"] = (
+        abs(valid_df["pixel diameter"] - average_single_diameter)
+        / max(average_single_diameter, 1e-6)
+    )
+
+    valid_df = valid_df[
+        valid_df["diameter relative error"] <= diameter_tolerance
+    ].copy()
+
+    valid_df = valid_df.reset_index(drop=True)
+    valid_df["Barcode Number"] = np.arange(1, len(valid_df) + 1)
+
+    return valid_df
+
+
+# Generate reporter mask from the reporter image
+
+def create_reporter_mask(
+    reporter_gray: np.ndarray,
+) -> np.ndarray:
+
+    reporter_gray = reporter_gray.astype(np.float32)
+
+    if reporter_gaussian_sigma > 0:
+        reporter_smooth = filters.gaussian(
+            reporter_gray,
+            sigma=reporter_gaussian_sigma,
+            preserve_range=True,
+        )
+    else:
+        reporter_smooth = reporter_gray
+
+    height, width = reporter_smooth.shape
+
+    border_y = int(height * reporter_border_fraction_for_threshold)
+    border_x = int(width * reporter_border_fraction_for_threshold)
+
+    if (height - 2 * border_y > 10) and (width - 2 * border_x > 10):
+        threshold_region = reporter_smooth[
+            border_y:height - border_y,
+            border_x:width - border_x,
+        ]
+    else:
+        threshold_region = reporter_smooth
+
+    otsu_threshold = filters.threshold_otsu(threshold_region)
+    final_threshold = otsu_threshold * reporter_threshold_scale
+
+    reporter_mask = reporter_smooth > final_threshold
+
+    if reporter_remove_border_band > 0:
+        reporter_mask[:reporter_remove_border_band, :] = False
+        reporter_mask[-reporter_remove_border_band:, :] = False
+        reporter_mask[:, :reporter_remove_border_band] = False
+        reporter_mask[:, -reporter_remove_border_band:] = False
+
+    if reporter_opening_radius > 0:
+        reporter_mask = morphology.binary_opening(
+            reporter_mask,
+            footprint=morphology.disk(reporter_opening_radius),
+        )
+
+    if reporter_despeckle_min_area > 1:
+        reporter_mask = morphology.remove_small_objects(
+            reporter_mask,
+            min_size=reporter_despeckle_min_area,
+        )
+
+    return reporter_mask
+
+
+# Extract reporter signal from a circular ROI around the barcode centroid
+
+def extract_reporter_roi(
+    reporter_mask: np.ndarray,
+    reporter_gray: np.ndarray,
+    centroid_x: float,
+    centroid_y: float,
+    roi_diameter: float,
+) -> tuple[np.ndarray, np.ndarray]:
+
+    radius = max(roi_diameter / 2.0, 1.0)
+
+    x_start = max(int(np.floor(centroid_x - radius)), 0)
+    x_end = min(int(np.ceil(centroid_x + radius)) + 1, reporter_mask.shape[1])
+
+    y_start = max(int(np.floor(centroid_y - radius)), 0)
+    y_end = min(int(np.ceil(centroid_y + radius)) + 1, reporter_mask.shape[0])
+
+    mask_crop = reporter_mask[y_start:y_end, x_start:x_end]
+    intensity_crop = reporter_gray[y_start:y_end, x_start:x_end]
+
+    yy, xx = np.ogrid[y_start:y_end, x_start:x_end]
+
+    circular_roi = (
+        (xx - centroid_x) ** 2
+        + (yy - centroid_y) ** 2
+        <= radius ** 2
+    )
+
+    reporter_pixels_in_roi = mask_crop & circular_roi
+    reporter_intensities_in_roi = intensity_crop[reporter_pixels_in_roi]
+
+    return reporter_pixels_in_roi, reporter_intensities_in_roi
+
+
+# Measure whether reporter signal colocalizes with the barcode ROI
+
+def measure_reporter_colocalization(
+    reporter_mask: np.ndarray,
+    reporter_gray: np.ndarray,
+    centroid_x: float,
+    centroid_y: float,
+    barcode_diameter: float,
+) -> tuple[str, float]:
+
+    roi_diameter = barcode_diameter * reporter_roi_expansion_factor
+
+    required_reporter_diameter = (
+        barcode_diameter
+        * min_reporter_signal_fraction_of_barcode_diameter
+    )
+
+    reporter_pixels_in_roi, reporter_intensities_in_roi = extract_reporter_roi(
+        reporter_mask=reporter_mask,
+        reporter_gray=reporter_gray,
+        centroid_x=centroid_x,
+        centroid_y=centroid_y,
+        roi_diameter=roi_diameter,
+    )
+
+    if len(reporter_intensities_in_roi) > 0:
+        average_reporter_intensity = float(np.mean(reporter_intensities_in_roi))
+    else:
+        average_reporter_intensity = 0.0
+
+    reporter_labels = measure.label(reporter_pixels_in_roi)
+
+    if reporter_labels.max() == 0:
+        return "no", average_reporter_intensity
+
+    reporter_regions = measure.regionprops(reporter_labels)
+
+    reporter_diameters = [
+        get_equivalent_diameter(region)
+        for region in reporter_regions
+    ]
+
+    reporter_diameters = [
+        diameter
+        for diameter in reporter_diameters
+        if diameter is not None
+    ]
+
+    if not reporter_diameters:
+        return "no", average_reporter_intensity
+
+    largest_reporter_diameter = max(reporter_diameters)
+
+    if largest_reporter_diameter >= required_reporter_diameter:
+        colocalization = "yes"
+    else:
+        colocalization = "no"
+
+    return colocalization, average_reporter_intensity
+
+
+# Add reporter measurements to each valid barcode
+
+def add_reporter_measurements(
+    valid_barcodes_df: pd.DataFrame,
+    reporter_mask: np.ndarray,
+    reporter_gray: np.ndarray,
+) -> pd.DataFrame:
+
+    valid_barcodes_df = valid_barcodes_df.copy()
+
+    valid_barcodes_df["colocalization with reporter"] = "no"
+    valid_barcodes_df["average intensity of reporter signal"] = 0.0
+
+    for index, row in valid_barcodes_df.iterrows():
+        colocalization, average_reporter_intensity = measure_reporter_colocalization(
+            reporter_mask=reporter_mask,
+            reporter_gray=reporter_gray,
+            centroid_x=float(row["centroid X position"]),
+            centroid_y=float(row["centroid Y position"]),
+            barcode_diameter=float(row["pixel diameter"]),
+        )
+
+        valid_barcodes_df.at[index, "colocalization with reporter"] = colocalization
+        valid_barcodes_df.at[index, "average intensity of reporter signal"] = average_reporter_intensity
+
+    return valid_barcodes_df
+
+
+# Create colour-group reporter summary
+
+def create_colour_group_summary(
+    barcode_df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    summary_rows = []
+
+    if barcode_df.empty:
+        return pd.DataFrame(columns=[
+            "colour group",
+            "number of barcodes",
+            "number reporter positive",
+            "number reporter negative",
+            "fraction reporter positive",
+            "percent reporter positive",
+            "group reporter status",
+        ])
+
+    for colour_id, group_df in barcode_df.groupby("colour id", dropna=False):
+        number_of_barcodes = len(group_df)
+
+        number_reporter_positive = int(
+            (group_df["colocalization with reporter"] == "yes").sum()
+        )
+
+        number_reporter_negative = number_of_barcodes - number_reporter_positive
+
+        fraction_reporter_positive = (
+            number_reporter_positive / number_of_barcodes
+            if number_of_barcodes > 0
+            else 0.0
+        )
+
+        percent_reporter_positive = fraction_reporter_positive * 100
+
+        if fraction_reporter_positive >= group_positive_fraction_cutoff:
+            group_reporter_status = "positive"
+        else:
+            group_reporter_status = "negative"
+
+        summary_rows.append({
+            "colour group": colour_id,
+            "number of barcodes": number_of_barcodes,
+            "number reporter positive": number_reporter_positive,
+            "number reporter negative": number_reporter_negative,
+            "fraction reporter positive": fraction_reporter_positive,
+            "percent reporter positive": percent_reporter_positive,
+            "group reporter status": group_reporter_status,
+        })
+
+    group_summary_df = pd.DataFrame(summary_rows)
+
+    colour_order = {
+        "520": 1,
+        "575": 2,
+        "600": 3,
+        "unassigned": 4,
+    }
+
+    group_summary_df["sort order"] = group_summary_df["colour group"].map(
+        colour_order
+    ).fillna(99)
+
+    group_summary_df = group_summary_df.sort_values(
+        ["sort order", "colour group"]
+    ).drop(columns=["sort order"])
+
+    group_summary_df = group_summary_df.reset_index(drop=True)
+
+    return group_summary_df
+
+
+# Executes the barcode-reporter colocalization pipeline
+
+barcode_rgb = load_rgb_image(barcode_image_path)
+reporter_gray = load_gray_image(reporter_image_path)
+
+if reporter_gray.shape != barcode_rgb.shape[:2]:
+    raise ValueError(
+        "The barcode image and reporter image must have the same dimensions.\n"
+        f"Barcode image shape: {barcode_rgb.shape[:2]}\n"
+        f"Reporter image shape: {reporter_gray.shape}"
+    )
+
+candidate_barcodes_df = detect_candidate_barcodes(barcode_rgb)
+
+valid_barcodes_df = filter_valid_barcodes(candidate_barcodes_df)
+
+reporter_mask = create_reporter_mask(reporter_gray)
+
+valid_barcodes_df = add_reporter_measurements(
+    valid_barcodes_df=valid_barcodes_df,
+    reporter_mask=reporter_mask,
+    reporter_gray=reporter_gray,
+)
+
+barcode_final_columns = [
+    "Barcode Number",
+    "centroid X position",
+    "centroid Y position",
+    "pixel diameter",
+    "average r",
+    "average g",
+    "average b",
+    "normalized r",
+    "normalized g",
+    "normalized b",
+    "channel rank 1",
+    "channel rank 2",
+    "channel rank 3",
+    "colour id",
+    "colocalization with reporter",
+    "average intensity of reporter signal",
+]
+
+barcode_final_df = valid_barcodes_df[barcode_final_columns].copy()
+
+group_summary_df = create_colour_group_summary(barcode_final_df)
+
+barcode_final_df.to_csv(barcode_output_csv_path, index=False)
+group_summary_df.to_csv(group_output_csv_path, index=False)
+
+print("Analysis complete.")
+print(f"Barcode-level CSV saved to: {barcode_output_csv_path.resolve()}")
+print(f"Colour-group summary CSV saved to: {group_output_csv_path.resolve()}")
