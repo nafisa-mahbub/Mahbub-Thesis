@@ -1,0 +1,912 @@
+# Colocalization with k-means for Figure 4.7
+
+# Libraries
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+from PIL import Image
+from scipy.ndimage import distance_transform_edt
+from skimage import filters, measure, morphology
+from skimage.segmentation import clear_border
+from sklearn.cluster import KMeans
+
+
+# User inputs for barcode-reporter image pairs
+
+number_of_image_pairs = int(input("Enter the number of barcode-reporter image pairs: ").strip())
+
+image_paths = []
+
+print("\nEnter image paths in this order:")
+print("barcode file 1, reporter file 1, barcode file 2, reporter file 2, ...")
+
+for pair_index in range(1, number_of_image_pairs + 1):
+    barcode_path = Path(input(f"Enter barcode image path for pair {pair_index}: ").strip().strip('"'))
+    reporter_path = Path(input(f"Enter reporter image path for pair {pair_index}: ").strip().strip('"'))
+
+    image_paths.append(barcode_path)
+    image_paths.append(reporter_path)
+
+output_folder = Path(input("Enter the output folder path: ").strip().strip('"'))
+
+output_folder.mkdir(parents=True, exist_ok=True)
+
+combined_output_csv_name = "combined_barcode_colour_reporter_colocalization_kmeans.csv"
+combined_output_csv_path = output_folder / combined_output_csv_name
+
+
+# Barcode detection settings
+
+# Objects smaller than this are removed
+
+min_area = 20
+
+# Cluster filter
+
+h_maxima_height = 0.68
+
+# Background correction
+
+background_sigma = 30
+
+# Otsu threshold multiplier
+
+threshold_scale = 1.75
+
+# Removes minor artifacts
+
+opening_radius = 1
+
+# Diameter tolerance relative to the average single-barcode diameter
+
+diameter_tolerance = 0.40
+
+# Remove barcode candidates that touch the image border
+
+reject_border_touching = True
+
+
+# K-means colour assignment settings
+
+# Number of barcode colour clusters
+
+number_of_kmeans_clusters = 3
+
+# Random state for reproducible k-means clustering
+
+kmeans_random_state = 42
+
+# Number of k-means initializations
+
+kmeans_n_init = 20
+
+# K-means uses normalized red and normalized blue values
+
+kmeans_feature_columns = ["normalized r", "normalized b"]
+
+
+# Reporter detection settings
+
+# Expands the reporter ROI around each barcode
+
+reporter_roi_expansion_factor = 1.10
+
+# Minimum reporter object diameter relative to barcode diameter
+
+min_reporter_signal_fraction_of_barcode_diameter = 0.30
+
+# Smooths the reporter image before thresholding
+
+reporter_gaussian_sigma = 1.0
+
+# Otsu threshold multiplier for the reporter image
+
+reporter_threshold_scale = 1.25
+
+# Removes small reporter specks
+
+reporter_despeckle_min_area = 8
+
+# Removes minor reporter mask artifacts
+
+reporter_opening_radius = 1
+
+# Uses the centre of the reporter image to calculate threshold
+
+reporter_border_fraction_for_threshold = 0.08
+
+# Removes reporter signal from image border
+
+reporter_remove_border_band = 5
+
+
+# Group-level positivity setting
+
+# A colour group is positive if at least 70% of barcodes in that group are reporter-positive
+
+group_positive_fraction_cutoff = 0.70
+
+
+# Checks that the image path exists and is an image file
+
+def validate_image_path(image_path: Path) -> Path:
+
+    image_path = Path(str(image_path).strip().strip('"'))
+
+    if not image_path.exists():
+        raise FileNotFoundError(f"File does not exist:\n{image_path}")
+
+    if image_path.is_dir():
+        raise IsADirectoryError(
+            f"This path is a folder, not an image file:\n{image_path}\n"
+            "Paste the full path ending in .tif, .tiff, .png, .jpg, etc."
+        )
+
+    return image_path
+
+
+# Load barcode image as RGB
+
+def load_rgb_image(image_path: Path) -> np.ndarray:
+
+    image_path = validate_image_path(image_path)
+
+    return np.asarray(Image.open(image_path).convert("RGB"))
+
+
+# Load reporter image as grayscale
+
+def load_gray_image(image_path: Path) -> np.ndarray:
+
+    image_path = validate_image_path(image_path)
+
+    return np.asarray(Image.open(image_path).convert("L"))
+
+
+# Converts a value to a float unless it is not valid
+
+def safe_float(value) -> Optional[float]:
+
+    if value is None:
+        return None
+
+    value = float(value)
+
+    if np.isnan(value) or np.isinf(value):
+        return None
+
+    return value
+
+
+# Checks if the barcode candidate touches the image border
+
+def touches_border(
+    bbox: tuple[int, int, int, int],
+    image_shape: tuple[int, int],
+) -> bool:
+
+    min_row, min_col, max_row, max_col = bbox
+    n_rows, n_cols = image_shape
+
+    return (
+        min_row <= 0
+        or min_col <= 0
+        or max_row >= n_rows
+        or max_col >= n_cols
+    )
+
+
+# Measures equivalent pixel diameter of the object
+
+def get_equivalent_diameter(region) -> Optional[float]:
+
+    diameter = getattr(region, "equivalent_diameter_area", None)
+
+    if diameter is None:
+        diameter = getattr(region, "equivalent_diameter", None)
+
+    return safe_float(diameter)
+
+
+# Gets a short file identifier from the image file name
+
+def get_file_identifier(image_path: Path) -> str:
+
+    file_stem = Path(image_path).stem
+
+    if len(file_stem) <= 8:
+        return file_stem
+
+    return file_stem[-8:]
+
+
+# Normalize RGB values so red, green, and blue sum to one
+
+def normalize_rgb(
+    average_r: float,
+    average_g: float,
+    average_b: float,
+) -> tuple[float, float, float]:
+
+    total = average_r + average_g + average_b
+
+    if total <= 0:
+        return 0.0, 0.0, 0.0
+
+    normalized_r = average_r / total
+    normalized_g = average_g / total
+    normalized_b = average_b / total
+
+    return normalized_r, normalized_g, normalized_b
+
+
+# Calculate average RGB and normalized RGB for one barcode
+
+def calculate_average_rgb(
+    barcode_pixels: np.ndarray,
+) -> tuple[float, float, float, float, float, float]:
+
+    average_r = float(np.mean(barcode_pixels[:, 0]))
+    average_g = float(np.mean(barcode_pixels[:, 1]))
+    average_b = float(np.mean(barcode_pixels[:, 2]))
+
+    normalized_r, normalized_g, normalized_b = normalize_rgb(
+        average_r=average_r,
+        average_g=average_g,
+        average_b=average_b,
+    )
+
+    return (
+        average_r,
+        average_g,
+        average_b,
+        normalized_r,
+        normalized_g,
+        normalized_b,
+    )
+
+
+# Generate a colour-neutral fluorescence score for barcode detection
+
+def calculate_fluorescence_score(rgb_image: np.ndarray) -> np.ndarray:
+
+    rgb_image = rgb_image.astype(np.float32)
+
+    max_channel = np.max(rgb_image, axis=2)
+    mean_channel = np.mean(rgb_image, axis=2)
+
+    fluorescence_score = max_channel + 0.25 * mean_channel
+
+    return fluorescence_score
+
+
+# Generate barcode mask from the fluorescence score
+
+def create_barcode_mask(
+    fluorescence_score: np.ndarray,
+) -> np.ndarray:
+
+    background = filters.gaussian(
+        fluorescence_score,
+        sigma=background_sigma,
+        preserve_range=True,
+    )
+
+    corrected_score = fluorescence_score - background
+    corrected_score = np.clip(corrected_score, 0, None)
+
+    otsu_threshold = filters.threshold_otsu(corrected_score)
+    final_threshold = otsu_threshold * threshold_scale
+
+    barcode_mask = corrected_score > final_threshold
+
+    barcode_mask = morphology.remove_small_objects(
+        barcode_mask,
+        min_size=min_area,
+    )
+
+    if opening_radius > 0:
+        barcode_mask = morphology.binary_opening(
+            barcode_mask,
+            footprint=morphology.disk(opening_radius),
+        )
+
+    return barcode_mask
+
+
+# Determine if the detected object is a single barcode or a cluster
+
+def count_internal_peaks(
+    label_image: np.ndarray,
+    component_label: int,
+    bbox: tuple[int, int, int, int],
+) -> int:
+
+    min_row, min_col, max_row, max_col = bbox
+
+    pad = 2
+
+    row_start = max(min_row - pad, 0)
+    col_start = max(min_col - pad, 0)
+    row_end = min(max_row + pad, label_image.shape[0])
+    col_end = min(max_col + pad, label_image.shape[1])
+
+    component_mask = label_image[row_start:row_end, col_start:col_end] == component_label
+
+    distance_map = distance_transform_edt(component_mask)
+
+    peaks = morphology.h_maxima(
+        distance_map,
+        h=h_maxima_height,
+    )
+
+    peaks = peaks & component_mask
+    peaks = clear_border(peaks)
+
+    peak_count = int(measure.label(peaks).max())
+
+    return max(peak_count, 1)
+
+
+# Detect barcode candidates and measure RGB signatures
+
+def detect_candidate_barcodes(
+    barcode_rgb: np.ndarray,
+) -> pd.DataFrame:
+
+    fluorescence_score = calculate_fluorescence_score(barcode_rgb)
+    barcode_mask = create_barcode_mask(fluorescence_score)
+    label_image = measure.label(barcode_mask)
+
+    regions = measure.regionprops(label_image, intensity_image=fluorescence_score)
+    regions = sorted(regions, key=lambda region: (region.centroid[0], region.centroid[1]))
+
+    rows = []
+
+    for region in regions:
+        component_mask = label_image == region.label
+        barcode_pixels = barcode_rgb[component_mask]
+
+        if len(barcode_pixels) == 0:
+            continue
+
+        rows_px, cols_px = np.nonzero(component_mask)
+        weights = fluorescence_score[component_mask].astype(np.float64)
+
+        if np.allclose(weights.sum(), 0):
+            centroid_y, centroid_x = region.centroid
+        else:
+            centroid_y = float(np.average(rows_px, weights=weights))
+            centroid_x = float(np.average(cols_px, weights=weights))
+
+        internal_peak_count = count_internal_peaks(
+            label_image=label_image,
+            component_label=region.label,
+            bbox=region.bbox,
+        )
+
+        category = "cluster" if internal_peak_count > 1 else "single"
+
+        pixel_diameter = get_equivalent_diameter(region)
+
+        (
+            average_r,
+            average_g,
+            average_b,
+            normalized_r,
+            normalized_g,
+            normalized_b,
+        ) = calculate_average_rgb(barcode_pixels)
+
+        rows.append({
+            "component_label": int(region.label),
+            "category": category,
+            "touches_border": touches_border(region.bbox, label_image.shape),
+
+            "centroid X position": centroid_x,
+            "centroid Y position": centroid_y,
+            "pixel diameter": pixel_diameter,
+
+            "average r": average_r,
+            "average g": average_g,
+            "average b": average_b,
+
+            "normalized r": normalized_r,
+            "normalized g": normalized_g,
+            "normalized b": normalized_b,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# Keep only valid single barcode objects
+
+# A valid barcode is: single, does not touch the image border, and has a diameter within the selected tolerance
+
+def filter_valid_barcodes(
+    candidate_df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if candidate_df.empty:
+        return candidate_df.copy()
+
+    valid_df = candidate_df[
+        (candidate_df["category"] == "single")
+        & (candidate_df["pixel diameter"].notna())
+    ].copy()
+
+    if reject_border_touching:
+        valid_df = valid_df[valid_df["touches_border"] == False].copy()
+
+    if valid_df.empty:
+        return valid_df
+
+    average_single_diameter = float(valid_df["pixel diameter"].mean())
+
+    valid_df["diameter relative error"] = (
+        abs(valid_df["pixel diameter"] - average_single_diameter)
+        / max(average_single_diameter, 1e-6)
+    )
+
+    valid_df = valid_df[
+        valid_df["diameter relative error"] <= diameter_tolerance
+    ].copy()
+
+    valid_df = valid_df.reset_index(drop=True)
+    valid_df["Barcode Number"] = np.arange(1, len(valid_df) + 1)
+
+    return valid_df
+
+
+# Generate reporter mask from the reporter image
+
+def create_reporter_mask(
+    reporter_gray: np.ndarray,
+) -> np.ndarray:
+
+    reporter_gray = reporter_gray.astype(np.float32)
+
+    if reporter_gaussian_sigma > 0:
+        reporter_smooth = filters.gaussian(
+            reporter_gray,
+            sigma=reporter_gaussian_sigma,
+            preserve_range=True,
+        )
+    else:
+        reporter_smooth = reporter_gray
+
+    height, width = reporter_smooth.shape
+
+    border_y = int(height * reporter_border_fraction_for_threshold)
+    border_x = int(width * reporter_border_fraction_for_threshold)
+
+    if (height - 2 * border_y > 10) and (width - 2 * border_x > 10):
+        threshold_region = reporter_smooth[
+            border_y:height - border_y,
+            border_x:width - border_x,
+        ]
+    else:
+        threshold_region = reporter_smooth
+
+    otsu_threshold = filters.threshold_otsu(threshold_region)
+    final_threshold = otsu_threshold * reporter_threshold_scale
+
+    reporter_mask = reporter_smooth > final_threshold
+
+    if reporter_remove_border_band > 0:
+        reporter_mask[:reporter_remove_border_band, :] = False
+        reporter_mask[-reporter_remove_border_band:, :] = False
+        reporter_mask[:, :reporter_remove_border_band] = False
+        reporter_mask[:, -reporter_remove_border_band:] = False
+
+    if reporter_opening_radius > 0:
+        reporter_mask = morphology.binary_opening(
+            reporter_mask,
+            footprint=morphology.disk(reporter_opening_radius),
+        )
+
+    if reporter_despeckle_min_area > 1:
+        reporter_mask = morphology.remove_small_objects(
+            reporter_mask,
+            min_size=reporter_despeckle_min_area,
+        )
+
+    return reporter_mask
+
+
+# Extract reporter-positive pixels inside a circular ROI around the barcode centroid
+
+def extract_reporter_roi(
+    reporter_mask: np.ndarray,
+    reporter_gray: np.ndarray,
+    centroid_x: float,
+    centroid_y: float,
+    roi_diameter: float,
+) -> tuple[np.ndarray, np.ndarray]:
+
+    radius = max(roi_diameter / 2.0, 1.0)
+
+    x_start = max(int(np.floor(centroid_x - radius)), 0)
+    x_end = min(int(np.ceil(centroid_x + radius)) + 1, reporter_mask.shape[1])
+
+    y_start = max(int(np.floor(centroid_y - radius)), 0)
+    y_end = min(int(np.ceil(centroid_y + radius)) + 1, reporter_mask.shape[0])
+
+    mask_crop = reporter_mask[y_start:y_end, x_start:x_end]
+    intensity_crop = reporter_gray[y_start:y_end, x_start:x_end]
+
+    yy, xx = np.ogrid[y_start:y_end, x_start:x_end]
+
+    circular_roi = (
+        (xx - centroid_x) ** 2
+        + (yy - centroid_y) ** 2
+        <= radius ** 2
+    )
+
+    reporter_pixels_in_roi = mask_crop & circular_roi
+    reporter_intensities_in_roi = intensity_crop[reporter_pixels_in_roi]
+
+    return reporter_pixels_in_roi, reporter_intensities_in_roi
+
+
+# Measure whether reporter signal colocalizes with the barcode ROI
+
+def measure_reporter_colocalization(
+    reporter_mask: np.ndarray,
+    reporter_gray: np.ndarray,
+    centroid_x: float,
+    centroid_y: float,
+    barcode_diameter: float,
+) -> tuple[str, float]:
+
+    roi_diameter = barcode_diameter * reporter_roi_expansion_factor
+
+    required_reporter_diameter = (
+        barcode_diameter
+        * min_reporter_signal_fraction_of_barcode_diameter
+    )
+
+    reporter_pixels_in_roi, reporter_intensities_in_roi = extract_reporter_roi(
+        reporter_mask=reporter_mask,
+        reporter_gray=reporter_gray,
+        centroid_x=centroid_x,
+        centroid_y=centroid_y,
+        roi_diameter=roi_diameter,
+    )
+
+    if len(reporter_intensities_in_roi) > 0:
+        average_reporter_intensity = float(np.mean(reporter_intensities_in_roi))
+    else:
+        average_reporter_intensity = 0.0
+
+    reporter_labels = measure.label(reporter_pixels_in_roi)
+
+    if reporter_labels.max() == 0:
+        return "no", average_reporter_intensity
+
+    reporter_regions = measure.regionprops(reporter_labels)
+
+    reporter_diameters = [
+        get_equivalent_diameter(region)
+        for region in reporter_regions
+    ]
+
+    reporter_diameters = [
+        diameter
+        for diameter in reporter_diameters
+        if diameter is not None
+    ]
+
+    if not reporter_diameters:
+        return "no", average_reporter_intensity
+
+    largest_reporter_diameter = max(reporter_diameters)
+
+    if largest_reporter_diameter >= required_reporter_diameter:
+        colocalization = "yes"
+    else:
+        colocalization = "no"
+
+    return colocalization, average_reporter_intensity
+
+
+# Add reporter measurements to each valid barcode
+
+def add_reporter_measurements(
+    valid_barcodes_df: pd.DataFrame,
+    reporter_mask: np.ndarray,
+    reporter_gray: np.ndarray,
+) -> pd.DataFrame:
+
+    valid_barcodes_df = valid_barcodes_df.copy()
+
+    valid_barcodes_df["colocalization with reporter"] = "no"
+    valid_barcodes_df["average intensity of reporter signal"] = 0.0
+
+    for index, row in valid_barcodes_df.iterrows():
+        colocalization, average_reporter_intensity = measure_reporter_colocalization(
+            reporter_mask=reporter_mask,
+            reporter_gray=reporter_gray,
+            centroid_x=float(row["centroid X position"]),
+            centroid_y=float(row["centroid Y position"]),
+            barcode_diameter=float(row["pixel diameter"]),
+        )
+
+        valid_barcodes_df.at[index, "colocalization with reporter"] = colocalization
+        valid_barcodes_df.at[index, "average intensity of reporter signal"] = average_reporter_intensity
+
+    return valid_barcodes_df
+
+
+# Process one barcode-reporter image pair
+
+def process_image_pair(
+    barcode_image_path: Path,
+    reporter_image_path: Path,
+    pair_number: int,
+) -> pd.DataFrame:
+
+    barcode_rgb = load_rgb_image(barcode_image_path)
+    reporter_gray = load_gray_image(reporter_image_path)
+
+    if reporter_gray.shape != barcode_rgb.shape[:2]:
+        raise ValueError(
+            "The barcode image and reporter image must have the same dimensions.\n"
+            f"Pair number: {pair_number}\n"
+            f"Barcode image: {barcode_image_path}\n"
+            f"Reporter image: {reporter_image_path}\n"
+            f"Barcode image shape: {barcode_rgb.shape[:2]}\n"
+            f"Reporter image shape: {reporter_gray.shape}"
+        )
+
+    candidate_barcodes_df = detect_candidate_barcodes(barcode_rgb)
+    valid_barcodes_df = filter_valid_barcodes(candidate_barcodes_df)
+
+    reporter_mask = create_reporter_mask(reporter_gray)
+
+    valid_barcodes_df = add_reporter_measurements(
+        valid_barcodes_df=valid_barcodes_df,
+        reporter_mask=reporter_mask,
+        reporter_gray=reporter_gray,
+    )
+
+    file_identifier = get_file_identifier(barcode_image_path)
+
+    valid_barcodes_df["image pair number"] = pair_number
+    valid_barcodes_df["file name last 8 characters"] = file_identifier
+    valid_barcodes_df["barcode file name"] = Path(barcode_image_path).name
+    valid_barcodes_df["reporter file name"] = Path(reporter_image_path).name
+
+    return valid_barcodes_df
+
+
+# Map k-means clusters to barcode wavelength identities
+
+def map_kmeans_clusters_to_wavelengths(
+    cluster_centres_df: pd.DataFrame,
+) -> dict[int, str]:
+
+    if len(cluster_centres_df) != 3:
+        raise ValueError(
+            "This wavelength mapping function expects exactly three clusters."
+        )
+
+    centres = cluster_centres_df.copy()
+
+    cluster_520 = int(
+        centres.sort_values(
+            by=["center normalized r", "center normalized b"],
+            ascending=[True, False],
+        ).iloc[0]["kmeans cluster"]
+    )
+
+    cluster_600 = int(
+        centres.sort_values(
+            by=["center normalized r", "center normalized b"],
+            ascending=[False, True],
+        ).iloc[0]["kmeans cluster"]
+    )
+
+    remaining_clusters = [
+        int(cluster)
+        for cluster in centres["kmeans cluster"].tolist()
+        if int(cluster) not in [cluster_520, cluster_600]
+    ]
+
+    if len(remaining_clusters) != 1:
+        raise ValueError("Could not identify the remaining 575-nm cluster.")
+
+    cluster_575 = remaining_clusters[0]
+
+    cluster_to_wavelength = {
+        cluster_520: "520",
+        cluster_575: "575",
+        cluster_600: "600",
+    }
+
+    return cluster_to_wavelength
+
+
+# Apply k-means clustering to normalized red and normalized blue values
+
+def add_kmeans_colour_assignment(
+    combined_df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    combined_df = combined_df.copy()
+
+    if combined_df.empty:
+        raise RuntimeError("No valid barcodes were found for k-means clustering.")
+
+    usable_df = combined_df[
+        combined_df[kmeans_feature_columns].notna().all(axis=1)
+    ].copy()
+
+    if len(usable_df) < number_of_kmeans_clusters:
+        raise RuntimeError(
+            "There are fewer valid barcodes than the number of k-means clusters."
+        )
+
+    feature_matrix = usable_df[kmeans_feature_columns].astype(float).to_numpy()
+
+    kmeans_model = KMeans(
+        n_clusters=number_of_kmeans_clusters,
+        random_state=kmeans_random_state,
+        n_init=kmeans_n_init,
+    )
+
+    cluster_labels = kmeans_model.fit_predict(feature_matrix)
+
+    combined_df["kmeans cluster"] = np.nan
+    combined_df["colour id"] = "unassigned"
+
+    combined_df.loc[usable_df.index, "kmeans cluster"] = cluster_labels
+
+    cluster_centres_df = pd.DataFrame({
+        "kmeans cluster": np.arange(number_of_kmeans_clusters),
+        "center normalized r": kmeans_model.cluster_centers_[:, 0],
+        "center normalized b": kmeans_model.cluster_centers_[:, 1],
+    })
+
+    cluster_to_wavelength = map_kmeans_clusters_to_wavelengths(cluster_centres_df)
+
+    for index in usable_df.index:
+        cluster_label = int(combined_df.at[index, "kmeans cluster"])
+        combined_df.at[index, "colour id"] = cluster_to_wavelength[cluster_label]
+
+    return combined_df
+
+
+# Calculate reporter agreement within each colour group for each image pair
+
+def add_group_agreement_columns(
+    barcode_df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    barcode_df = barcode_df.copy()
+
+    barcode_df["% beads positive"] = 0.0
+    barcode_df["% beads negative"] = 0.0
+    barcode_df["group reporter status"] = "negative"
+
+    if barcode_df.empty:
+        return barcode_df
+
+    grouped = barcode_df.groupby(
+        ["image pair number", "colour id"],
+        dropna=False,
+    )
+
+    for _, group_df in grouped:
+        group_size = len(group_df)
+
+        if group_size == 0:
+            percent_positive = 0.0
+            percent_negative = 0.0
+        else:
+            number_positive = int(
+                (group_df["colocalization with reporter"] == "yes").sum()
+            )
+
+            number_negative = group_size - number_positive
+
+            percent_positive = (number_positive / group_size) * 100.0
+            percent_negative = (number_negative / group_size) * 100.0
+
+        if percent_positive >= group_positive_fraction_cutoff * 100.0:
+            group_status = "positive"
+        else:
+            group_status = "negative"
+
+        barcode_df.loc[group_df.index, "% beads positive"] = percent_positive
+        barcode_df.loc[group_df.index, "% beads negative"] = percent_negative
+        barcode_df.loc[group_df.index, "group reporter status"] = group_status
+
+    return barcode_df
+
+
+# Executes the batch barcode-reporter colocalization pipeline
+
+all_results = []
+
+for pair_index in range(number_of_image_pairs):
+    barcode_path = image_paths[2 * pair_index]
+    reporter_path = image_paths[2 * pair_index + 1]
+    pair_number = pair_index + 1
+
+    print(f"\nProcessing pair {pair_number}:")
+    print(f"  Barcode image: {barcode_path}")
+    print(f"  Reporter image: {reporter_path}")
+
+    pair_results_df = process_image_pair(
+        barcode_image_path=barcode_path,
+        reporter_image_path=reporter_path,
+        pair_number=pair_number,
+    )
+
+    all_results.append(pair_results_df)
+
+if all_results:
+    combined_df = pd.concat(all_results, ignore_index=True)
+else:
+    combined_df = pd.DataFrame()
+
+
+# Apply k-means colour assignment
+
+combined_df = add_kmeans_colour_assignment(combined_df)
+
+
+# Add group-level reporter status
+
+combined_df = add_group_agreement_columns(combined_df)
+
+
+# Save final CSV output
+
+final_columns = [
+    "image pair number",
+    "file name last 8 characters",
+    "barcode file name",
+    "reporter file name",
+
+    "Barcode Number",
+    "centroid X position",
+    "centroid Y position",
+    "pixel diameter",
+
+    "average r",
+    "average g",
+    "average b",
+
+    "normalized r",
+    "normalized g",
+    "normalized b",
+
+    "kmeans cluster",
+    "colour id",
+
+    "colocalization with reporter",
+    "average intensity of reporter signal",
+
+    "% beads positive",
+    "% beads negative",
+    "group reporter status",
+]
+
+for column in final_columns:
+    if column not in combined_df.columns:
+        combined_df[column] = None
+
+combined_df = combined_df[final_columns].copy()
+
+combined_df.to_csv(combined_output_csv_path, index=False)
+
+print("\nBatch analysis complete.")
+print(f"Combined CSV saved to: {combined_output_csv_path.resolve()}")
